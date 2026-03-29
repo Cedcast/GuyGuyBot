@@ -1,0 +1,44 @@
+# Central configuration for GuyGuyBot
+# Replace all placeholder values before running.
+
+telegram:
+  bot_token: "YOUR_BOT_TOKEN_HERE"
+  chat_id: "YOUR_CHAT_ID_HERE"
+  stats_schedule:
+    weekly: true
+    monthly: true
+    quarterly: true
+
+database:
+  path: "data/guybot.db"
+
+trading:
+  pairs:
+    - "BTCUSDT"
+    - "ETHUSDT"
+    - "BNBUSDT"
+    - "XRPUSDT"
+    - "SOLUSDT"
+    - "ADAUSDT"
+    - "DOGEUSDT"
+  risk_per_trade: 0.01   # 1% of account per trade
+  account_size: 1000.0   # USD paper account size
+
+engines:
+  scalping:
+    enabled: true
+    timeframes: ["1m", "5m", "15m", "30m"]
+    scan_interval: 60     # seconds between scans
+  swing:
+    enabled: true
+    timeframes: ["4h", "1d"]
+    scan_interval: 3600   # seconds between scans
+
+llm:
+  # Available models: claude, gpt5, grok
+  primary_agents: ["claude", "gpt5"]   # Two agents run per signal
+  arbitration_agent: "grok"             # Third agent for arbitration/summaries
+  # API keys - replace with your actual keys
+  claude_api_key: "YOUR_CLAUDE_API_KEY"
+  gpt5_api_key: "YOUR_GPT5_API_KEY"
+  grok_api_key: "YOUR_GROK_API_KEY"
