@@ -43,8 +43,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Callback data prefixes for inline buttons
-_CB_OPEN = "open_trade:"
-_CB_SKIP = "skip_trade:"
+_CB_OPEN = "accept_"
+_CB_SKIP = "skip_"
 
 
 class GuyGuyBot:
@@ -110,12 +110,15 @@ class GuyGuyBot:
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
     async def _cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle the /stats command — show the latest weekly stats."""
-        stats = self._signal_logger.get_stats("weekly")
-        if stats:
-            text = format_stats_message(stats)
-        else:
-            text = "📊 No stats available yet. Stats are computed weekly."
+        """Handle the /stats command — show weekly and monthly stats."""
+        lines = []
+        for period in ("weekly", "monthly"):
+            stats = self._signal_logger.get_stats(period)
+            if stats:
+                lines.append(format_stats_message(stats))
+            else:
+                lines.append(f"📊 No {period} stats available yet.")
+        text = "\n\n".join(lines)
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
     # ------------------------------------------------------------------
@@ -168,7 +171,7 @@ class GuyGuyBot:
             return
 
         await query.edit_message_text(
-            query.message.text + f"\n\n✅ <b>Trade Opened</b>  <code>Trade #{trade_id}</code>",
+            query.message.text + f"\n\n✅ <b>Trade Accepted</b>  — monitoring...  <code>Trade #{trade_id}</code>",
             parse_mode=ParseMode.HTML,
         )
         logger.info("Signal #%d opened as trade #%d via Telegram button", signal_id, trade_id)
@@ -184,7 +187,7 @@ class GuyGuyBot:
 
         self._signal_logger.update_signal_status(signal_id, "SKIPPED")
         await query.edit_message_text(
-            query.message.text + "\n\n❌ <b>Trade Skipped</b>",
+            query.message.text + "\n\n⏭ <b>Skipped</b>",
             parse_mode=ParseMode.HTML,
         )
         logger.info("Signal #%d skipped via Telegram button", signal_id)
@@ -205,8 +208,8 @@ class GuyGuyBot:
         text = format_signal_message(signal)
         keyboard = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("✅ Opened Trade", callback_data=f"{_CB_OPEN}{signal_id}"),
-                InlineKeyboardButton("❌ Skipped Trade", callback_data=f"{_CB_SKIP}{signal_id}"),
+                InlineKeyboardButton("✅ Accept Trade", callback_data=f"{_CB_OPEN}{signal_id}"),
+                InlineKeyboardButton("❌ Skip", callback_data=f"{_CB_SKIP}{signal_id}"),
             ]
         ])
         try:
