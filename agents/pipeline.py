@@ -159,10 +159,6 @@ class AgentPipeline:
             return None
         return signal
 
-    def build_agent_factory(config_llm: Any) -> "AgentPipeline":  # noqa: N805
-        """Convenience factory — not a method; see :func:`build_pipeline`."""
-        ...  # pragma: no cover
-
 
 def build_pipeline(config_llm: Any) -> AgentPipeline:
     """Construct an :class:`AgentPipeline` from the ``llm`` config section.
