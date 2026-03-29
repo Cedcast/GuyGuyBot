@@ -3,34 +3,40 @@ engines/scalping_engine.py
 --------------------------
 Scalping engine — monitors 1m, 5m, 15m and 30m timeframes.
 
-Market data fetching is stubbed with placeholder comments indicating
-exactly where to plug in a real Binance REST / WebSocket client.
-The stub generates a synthetic signal for demonstration purposes only.
+Uses real OHLCV data from Binance Futures via ExchangeClient and
+calculates real technical indicators via the indicators module.
+Win-rate boosters: funding rate filter, OI confirmation, multi-timeframe
+confluence, long/short ratio filter, and minimum confidence gate.
 """
 
 from __future__ import annotations
 
 import logging
-import random
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from data.indicators import (
+    calculate_atr,
+    calculate_ema,
+    calculate_rsi,
+    calculate_volume_sma,
+    detect_ema_crossover,
+)
 from engines.base_engine import BaseEngine
+
+if TYPE_CHECKING:
+    from data.exchange_client import ExchangeClient
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Placeholder: import your Binance client here, e.g.:
-#
-# from binance import AsyncClient  # python-binance
-# ---------------------------------------------------------------------------
+# Minimum number of candles required for indicator calculation
+_MIN_CANDLES = 50
+
+# Minimum confidence (after all adjustments) to pass signal to pipeline
+_MIN_CONFIDENCE = 0.55
 
 
 class ScalpingEngine(BaseEngine):
     """Short-term trade engine scanning 1m – 30m timeframes.
-
-    This class is intentionally thin — it gathers market data and hands
-    it off to the agent pipeline for signal generation.  All heavy signal
-    logic lives in the agents.
 
     Parameters
     ----------
@@ -38,22 +44,31 @@ class ScalpingEngine(BaseEngine):
         Symbols to scan.
     timeframes:
         Timeframes to iterate (default: ``["1m", "5m", "15m", "30m"]``).
+    exchange_client:
+        Optional :class:`~data.exchange_client.ExchangeClient` instance for
+        real Binance Futures data.  When not provided the engine returns no
+        candidates (fail-safe).
     """
+
+    def __init__(
+        self,
+        pairs: list[str],
+        timeframes: list[str] | None = None,
+        exchange_client: "ExchangeClient | None" = None,
+    ) -> None:
+        super().__init__(pairs=pairs, timeframes=timeframes)
+        self._client = exchange_client
 
     @property
     def engine_name(self) -> str:
         return "scalping"
 
     async def scan(self) -> list[dict[str, Any]]:
-        """Scan all pairs across all scalping timeframes.
+        """Scan all pairs across all scalping timeframes."""
+        if self._client is None:
+            logger.warning("ScalpingEngine: no ExchangeClient configured — skipping scan")
+            return []
 
-        Returns a list of candidate signal dicts (one per pair/timeframe
-        where a potential setup is detected).
-
-        **Stub behaviour**: returns a randomly generated signal for the
-        first pair/timeframe to demonstrate the pipeline end-to-end.
-        Replace with real Binance data fetching before going live.
-        """
         candidates: list[dict[str, Any]] = []
 
         for pair in self._pairs:
@@ -62,75 +77,163 @@ class ScalpingEngine(BaseEngine):
                 if market_data is None:
                     continue
 
-                # TODO: Replace stub logic with real technical analysis,
-                # e.g. RSI < 30, EMA crossover, volume spike, etc.
-                if self._has_setup(market_data):
-                    signal = self._build_signal(market_data)
-                    candidates.append(signal)
+                if not self._has_setup(market_data):
+                    continue
+
+                # Multi-timeframe confluence: check 1h trend agrees
+                if not await self._check_htf_confluence(pair, market_data):
+                    logger.debug("ScalpingEngine: HTF confluence failed for %s/%s", pair, timeframe)
+                    continue
+
+                signal = await self._build_signal(pair, market_data)
+                if signal is None:
+                    continue
+
+                candidates.append(signal)
 
         logger.info("ScalpingEngine scan complete — %d candidate(s) found", len(candidates))
         return candidates
 
     # ------------------------------------------------------------------
-    # Internal helpers (stub implementations)
+    # Market data fetching
     # ------------------------------------------------------------------
 
     async def _fetch_market_data(self, pair: str, timeframe: str) -> dict[str, Any] | None:
-        """Fetch OHLCV data from Binance for *pair* / *timeframe*.
-
-        **Stub**: returns synthetic data.  Replace with a real API call::
-
-            client = await AsyncClient.create(api_key, api_secret)
-            klines = await client.get_klines(symbol=pair, interval=timeframe, limit=100)
-            # parse klines into OHLCV list …
-
-        Returns ``None`` on error so the caller can skip gracefully.
-        """
-        # TODO: Replace with real Binance klines call.
+        """Fetch OHLCV data and compute indicators for *pair*/*timeframe*."""
+        assert self._client is not None
         try:
-            close = round(random.uniform(100.0, 70000.0), 2)
+            candles = await self._client.fetch_ohlcv(pair, timeframe, limit=200)
+            if len(candles) < _MIN_CANDLES:
+                logger.debug("ScalpingEngine: insufficient candles for %s/%s (%d)", pair, timeframe, len(candles))
+                return None
+
+            closes = [c["close"] for c in candles]
+            highs = [c["high"] for c in candles]
+            lows = [c["low"] for c in candles]
+            volumes = [c["volume"] for c in candles]
+
+            rsi = calculate_rsi(closes)
+            ema_fast = calculate_ema(closes, 9)
+            ema_slow = calculate_ema(closes, 21)
+            ema_crossover = detect_ema_crossover(closes, 9, 21)
+            atr = calculate_atr(highs, lows, closes)
+            vol_sma = calculate_volume_sma(volumes, 20)
+            current_volume = volumes[-1]
+            volume_ratio = current_volume / vol_sma if vol_sma > 0 else 1.0
+
             return {
                 "pair": pair,
                 "timeframe": timeframe,
-                "close": close,
-                "open": close * random.uniform(0.995, 1.005),
-                "high": close * random.uniform(1.001, 1.015),
-                "low": close * random.uniform(0.985, 0.999),
-                "volume": random.uniform(1000, 500000),
-                # Stub indicator placeholders — replace with real values.
+                "close": closes[-1],
+                "open": candles[-1]["open"],
+                "high": candles[-1]["high"],
+                "low": candles[-1]["low"],
+                "volume": current_volume,
+                "candles": candles,
+                "closes": closes,
+                "highs": highs,
+                "lows": lows,
+                "volumes": volumes,
                 "indicators": {
-                    "rsi": random.uniform(20, 80),
-                    "ema_fast": close * random.uniform(0.998, 1.002),
-                    "ema_slow": close * random.uniform(0.995, 1.005),
+                    "rsi": round(rsi, 2),
+                    "ema_fast": round(ema_fast, 6),
+                    "ema_slow": round(ema_slow, 6),
+                    "ema_crossover": ema_crossover,
+                    "atr": round(atr, 6),
+                    "volume_ratio": round(volume_ratio, 2),
                 },
             }
         except Exception as exc:
             logger.error("ScalpingEngine: failed to fetch %s/%s: %s", pair, timeframe, exc)
             return None
 
+    # ------------------------------------------------------------------
+    # Setup detection
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _has_setup(market_data: dict[str, Any]) -> bool:
-        """Return ``True`` if the market data shows a potential trade setup.
+        """Return True if at least 2 of 3 scalping conditions are met.
 
-        **Stub**: triggers on ~20 % of candles for demonstration.
-        Replace with real entry logic (RSI, MACD, price action, etc.).
+        Conditions:
+          1. RSI < 35 (oversold) or RSI > 65 (overbought)
+          2. EMA9 vs EMA21 crossover detected
+          3. Current volume > 1.5x 20-period average
         """
-        # TODO: Implement real entry condition logic.
-        return random.random() < 0.20  # noqa: S311
+        indicators = market_data.get("indicators", {})
+        rsi = float(indicators.get("rsi", 50))
+        ema_crossover = indicators.get("ema_crossover", "NONE")
+        volume_ratio = float(indicators.get("volume_ratio", 1.0))
 
-    @staticmethod
-    def _build_signal(market_data: dict[str, Any]) -> dict[str, Any]:
-        """Build a candidate signal dict from *market_data*.
+        condition_1 = rsi < 35 or rsi > 65
+        condition_2 = ema_crossover in ("BULLISH", "BEARISH")
+        condition_3 = volume_ratio > 1.5
 
-        Stop-loss and take-profit are calculated as simple ATR multiples
-        in the stub.  Replace with a proper risk/reward model.
-        """
+        met = sum([condition_1, condition_2, condition_3])
+        return met >= 2
+
+    # ------------------------------------------------------------------
+    # Multi-timeframe confluence
+    # ------------------------------------------------------------------
+
+    async def _check_htf_confluence(self, pair: str, market_data: dict[str, Any]) -> bool:
+        """Check that the 1h EMA trend agrees with the signal direction."""
+        assert self._client is not None
+        indicators = market_data.get("indicators", {})
+        ema_crossover = indicators.get("ema_crossover", "NONE")
+
+        # Only check confluence when there's a clear crossover direction
+        if ema_crossover == "NONE":
+            return True
+
+        try:
+            htf_candles = await self._client.fetch_ohlcv(pair, "1h", limit=50)
+            if len(htf_candles) < 30:
+                return True  # Not enough data → don't filter
+            htf_closes = [c["close"] for c in htf_candles]
+            htf_ema9 = calculate_ema(htf_closes, 9)
+            htf_ema21 = calculate_ema(htf_closes, 21)
+            htf_bullish = htf_ema9 > htf_ema21
+            if ema_crossover == "BULLISH" and not htf_bullish:
+                return False
+            if ema_crossover == "BEARISH" and htf_bullish:
+                return False
+            return True
+        except Exception as exc:
+            logger.debug("HTF confluence check failed for %s: %s", pair, exc)
+            return True  # Fail open
+
+    # ------------------------------------------------------------------
+    # Signal building with futures filters
+    # ------------------------------------------------------------------
+
+    async def _build_signal(self, pair: str, market_data: dict[str, Any]) -> dict[str, Any] | None:
+        """Build a signal with real ATR-based SL/TP and futures data filters."""
+        assert self._client is not None
+        indicators = market_data.get("indicators", {})
         close = float(market_data["close"])
-        direction = random.choice(["LONG", "SHORT"])  # noqa: S311
+        atr = float(indicators.get("atr", close * 0.005))
+        ema_crossover = indicators.get("ema_crossover", "NONE")
+        rsi = float(indicators.get("rsi", 50))
 
-        atr_pct = 0.005  # 0.5% as a stub for ATR
-        sl_distance = close * atr_pct
-        tp_distance = close * atr_pct * 2  # 2:1 RR
+        # Determine direction from EMA crossover; fall back to RSI extremes
+        if ema_crossover == "BULLISH":
+            direction = "LONG"
+        elif ema_crossover == "BEARISH":
+            direction = "SHORT"
+        elif rsi < 35:
+            direction = "LONG"
+        elif rsi > 65:
+            direction = "SHORT"
+        else:
+            return None  # No clear direction
+
+        # SL = 1.5x ATR; TP = 2x SL (minimum 2:1 RR)
+        sl_distance = atr * 1.5
+        tp_distance = sl_distance * 2.0
+
+        if sl_distance <= 0:
+            return None
 
         if direction == "LONG":
             stop_loss = round(close - sl_distance, 6)
@@ -139,15 +242,67 @@ class ScalpingEngine(BaseEngine):
             stop_loss = round(close + sl_distance, 6)
             take_profit = round(close - tp_distance, 6)
 
+        # Validate minimum 2:1 RR
+        risk = abs(close - stop_loss)
+        reward = abs(take_profit - close)
+        if risk <= 0 or (reward / risk) < 2.0:
+            return None
+
+        # Base confidence from RSI extremity and crossover
+        rsi_extremity = max(0.0, (abs(rsi - 50) - 15) / 35)  # 0→1 as RSI moves from 50 to 35/65
+        confidence = 0.55 + (rsi_extremity * 0.2)
+
+        # Fetch futures data
+        funding_rate, oi_data, ls_data = None, None, None
+        try:
+            funding_rate = await self._client.fetch_funding_rate(pair)
+            oi_data = await self._client.fetch_open_interest(pair)
+            ls_data = await self._client.fetch_long_short_ratio(pair)
+        except Exception as exc:
+            logger.debug("Failed to fetch futures data for %s: %s", pair, exc)
+
+        # Funding rate filter
+        if funding_rate is not None:
+            fr = float(funding_rate)
+            if direction == "LONG" and fr > 0.0005:
+                confidence -= 0.20
+            elif direction == "SHORT" and fr < -0.0005:
+                confidence -= 0.20
+
+        # Open interest filter
+        if oi_data is not None:
+            oi_change = float(oi_data.get("change_pct", 0))
+            if (direction == "LONG" and oi_change > 0) or (direction == "SHORT" and oi_change < 0):
+                confidence += 0.10
+
+        # Long/short ratio filter
+        if ls_data is not None:
+            ls_ratio = float(ls_data.get("long_short_ratio", 1.0))
+            if direction == "LONG" and ls_ratio > 2.0:
+                confidence -= 0.15
+
+        # Minimum confidence gate
+        confidence = round(min(0.95, max(0.0, confidence)), 4)
+        if confidence < _MIN_CONFIDENCE:
+            logger.debug("ScalpingEngine: confidence %.2f below gate for %s — skipped", confidence, pair)
+            return None
+
         return {
-            "pair": market_data["pair"],
+            "pair": pair,
             "engine": "scalping",
             "timeframe": market_data["timeframe"],
             "direction": direction,
             "entry": round(close, 6),
             "stop_loss": stop_loss,
             "take_profit": take_profit,
-            "confidence": round(random.uniform(0.5, 0.9), 2),  # noqa: S311
-            "reasoning": "Stub scalping signal — replace with real analysis.",
-            "market_data": market_data,
+            "confidence": confidence,
+            "reasoning": f"EMA crossover {ema_crossover}, RSI {rsi:.1f}, vol ratio {indicators.get('volume_ratio', 0):.1f}x",
+            "market_data": {
+                **market_data,
+                "futures": {
+                    "funding_rate": funding_rate,
+                    "open_interest": oi_data,
+                    "long_short_ratio": ls_data,
+                },
+            },
         }

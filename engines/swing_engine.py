@@ -3,33 +3,40 @@ engines/swing_engine.py
 -----------------------
 Swing engine — monitors 4h and 1d timeframes.
 
-Market data fetching is stubbed with placeholder comments indicating
-exactly where to plug in a real Binance REST / WebSocket client.
-The stub generates a synthetic signal for demonstration purposes only.
+Uses real OHLCV data from Binance Futures via ExchangeClient and
+calculates real technical indicators via the indicators module.
+Win-rate boosters: funding rate filter, OI confirmation, long/short
+ratio filter, RSI divergence, MACD trend, and minimum confidence gate.
 """
 
 from __future__ import annotations
 
 import logging
-import random
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from data.indicators import (
+    calculate_atr,
+    calculate_ema,
+    calculate_macd,
+    calculate_rsi,
+    detect_ema_crossover,
+    detect_rsi_divergence,
+)
 from engines.base_engine import BaseEngine
+
+if TYPE_CHECKING:
+    from data.exchange_client import ExchangeClient
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Placeholder: import your Binance client here, e.g.:
-#
-# from binance import AsyncClient  # python-binance
-# ---------------------------------------------------------------------------
+_MIN_CANDLES = 100
+
+# Minimum confidence (after all adjustments) to pass signal to pipeline
+_MIN_CONFIDENCE = 0.55
 
 
 class SwingEngine(BaseEngine):
     """Medium-to-longer-term trade engine scanning 4h and 1d timeframes.
-
-    This class is intentionally thin — it gathers market data and hands
-    it off to the agent pipeline for signal generation.
 
     Parameters
     ----------
@@ -37,21 +44,31 @@ class SwingEngine(BaseEngine):
         Symbols to scan.
     timeframes:
         Timeframes to iterate (default: ``["4h", "1d"]``).
+    exchange_client:
+        Optional :class:`~data.exchange_client.ExchangeClient` instance for
+        real Binance Futures data.  When not provided the engine returns no
+        candidates (fail-safe).
     """
+
+    def __init__(
+        self,
+        pairs: list[str],
+        timeframes: list[str] | None = None,
+        exchange_client: "ExchangeClient | None" = None,
+    ) -> None:
+        super().__init__(pairs=pairs, timeframes=timeframes)
+        self._client = exchange_client
 
     @property
     def engine_name(self) -> str:
         return "swing"
 
     async def scan(self) -> list[dict[str, Any]]:
-        """Scan all pairs across all swing timeframes.
+        """Scan all pairs across all swing timeframes."""
+        if self._client is None:
+            logger.warning("SwingEngine: no ExchangeClient configured — skipping scan")
+            return []
 
-        Returns a list of candidate signal dicts.
-
-        **Stub behaviour**: returns a randomly generated signal to
-        demonstrate the pipeline end-to-end.  Replace with real Binance
-        data fetching before going live.
-        """
         candidates: list[dict[str, Any]] = []
 
         for pair in self._pairs:
@@ -60,94 +77,220 @@ class SwingEngine(BaseEngine):
                 if market_data is None:
                     continue
 
-                # TODO: Replace stub logic with real technical analysis,
-                # e.g. weekly S/R levels, trend-following indicators,
-                # volume profile, etc.
-                if self._has_setup(market_data):
-                    signal = self._build_signal(market_data)
-                    candidates.append(signal)
+                if not self._has_setup(market_data):
+                    continue
+
+                signal = await self._build_signal(pair, market_data)
+                if signal is None:
+                    continue
+
+                candidates.append(signal)
 
         logger.info("SwingEngine scan complete — %d candidate(s) found", len(candidates))
         return candidates
 
     # ------------------------------------------------------------------
-    # Internal helpers (stub implementations)
+    # Market data fetching
     # ------------------------------------------------------------------
 
     async def _fetch_market_data(self, pair: str, timeframe: str) -> dict[str, Any] | None:
-        """Fetch OHLCV data from Binance for *pair* / *timeframe*.
-
-        **Stub**: returns synthetic data.  Replace with a real API call::
-
-            client = await AsyncClient.create(api_key, api_secret)
-            klines = await client.get_klines(symbol=pair, interval=timeframe, limit=200)
-            # parse klines into OHLCV list …
-
-        Returns ``None`` on error so the caller can skip gracefully.
-        """
-        # TODO: Replace with real Binance klines call.
+        """Fetch OHLCV data and compute indicators for *pair*/*timeframe*."""
+        assert self._client is not None
         try:
-            close = round(random.uniform(100.0, 70000.0), 2)
+            candles = await self._client.fetch_ohlcv(pair, timeframe, limit=300)
+            if len(candles) < _MIN_CANDLES:
+                logger.debug("SwingEngine: insufficient candles for %s/%s (%d)", pair, timeframe, len(candles))
+                return None
+
+            closes = [c["close"] for c in candles]
+            highs = [c["high"] for c in candles]
+            lows = [c["low"] for c in candles]
+
+            rsi = calculate_rsi(closes)
+            ema50 = calculate_ema(closes, 50)
+            ema200 = calculate_ema(closes, 200)
+            macd = calculate_macd(closes)
+            ema_crossover = detect_ema_crossover(closes, 50, 200)
+            atr = calculate_atr(highs, lows, closes)
+
+            # RSI series for divergence detection — compute full RSI series once via pandas
+            import pandas as pd
+            s = pd.Series(closes, dtype=float)
+            delta = s.diff()
+            gain = delta.clip(lower=0)
+            loss = -delta.clip(upper=0)
+            avg_gain = gain.ewm(com=13, min_periods=14).mean()
+            avg_loss = loss.ewm(com=13, min_periods=14).mean()
+            rs = avg_gain / avg_loss.replace(0, float("nan"))
+            rsi_full = (100 - (100 / (1 + rs))).fillna(50).tolist()
+            lookback = 30
+            rsi_series = rsi_full[-lookback:]
+            price_window = closes[-lookback:]
+            rsi_divergence = detect_rsi_divergence(price_window, rsi_series, lookback=20)
+
             return {
                 "pair": pair,
                 "timeframe": timeframe,
-                "close": close,
-                "open": close * random.uniform(0.99, 1.01),
-                "high": close * random.uniform(1.005, 1.03),
-                "low": close * random.uniform(0.97, 0.995),
-                "volume": random.uniform(5000, 2_000_000),
-                # Stub indicator placeholders — replace with real values.
+                "close": closes[-1],
+                "open": candles[-1]["open"],
+                "high": candles[-1]["high"],
+                "low": candles[-1]["low"],
+                "volume": candles[-1]["volume"],
+                "candles": candles,
+                "closes": closes,
+                "highs": highs,
+                "lows": lows,
                 "indicators": {
-                    "rsi": random.uniform(25, 75),
-                    "ema_50": close * random.uniform(0.97, 1.03),
-                    "ema_200": close * random.uniform(0.94, 1.06),
-                    "macd": random.uniform(-100, 100),
+                    "rsi": round(rsi, 2),
+                    "ema50": round(ema50, 6),
+                    "ema200": round(ema200, 6),
+                    "ema_crossover": ema_crossover,
+                    "macd": {
+                        "macd": round(macd["macd"], 6),
+                        "signal": round(macd["signal"], 6),
+                        "histogram": round(macd["histogram"], 6),
+                    },
+                    "atr": round(atr, 6),
+                    "rsi_divergence": rsi_divergence,
                 },
             }
         except Exception as exc:
             logger.error("SwingEngine: failed to fetch %s/%s: %s", pair, timeframe, exc)
             return None
 
+    # ------------------------------------------------------------------
+    # Setup detection
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _has_setup(market_data: dict[str, Any]) -> bool:
-        """Return ``True`` if the market data shows a potential swing setup.
+        """Return True if at least 2 of 3 swing setup conditions are met.
 
-        **Stub**: triggers on ~10 % of candles (lower frequency than scalping).
-        Replace with real entry logic (trend following, S/R breaks, etc.).
+        Conditions:
+          1. RSI divergence detected (BULLISH_DIV or BEARISH_DIV)
+          2. EMA50 vs EMA200 alignment (crossover or clear separation)
+          3. MACD histogram turning (positive = bullish, negative = bearish)
         """
-        # TODO: Implement real entry condition logic.
-        return random.random() < 0.10  # noqa: S311
+        indicators = market_data.get("indicators", {})
+        rsi_div = indicators.get("rsi_divergence", "NONE")
+        ema_crossover = indicators.get("ema_crossover", "NONE")
+        ema50 = float(indicators.get("ema50", 0))
+        ema200 = float(indicators.get("ema200", 0))
+        macd = indicators.get("macd", {})
+        macd_hist = float(macd.get("histogram", 0))
 
-    @staticmethod
-    def _build_signal(market_data: dict[str, Any]) -> dict[str, Any]:
-        """Build a candidate signal dict from *market_data*.
+        condition_1 = rsi_div in ("BULLISH_DIV", "BEARISH_DIV")
+        condition_2 = ema_crossover != "NONE" or (ema50 != 0 and ema200 != 0 and abs(ema50 - ema200) / ema200 > 0.005)
+        condition_3 = abs(macd_hist) > 0  # histogram is non-zero (turning)
 
-        Stop-loss and take-profit use wider multiples appropriate for
-        swing trades.  Replace with a proper risk/reward model.
-        """
+        met = sum([condition_1, condition_2, condition_3])
+        return met >= 2
+
+    # ------------------------------------------------------------------
+    # Signal building with futures filters
+    # ------------------------------------------------------------------
+
+    async def _build_signal(self, pair: str, market_data: dict[str, Any]) -> dict[str, Any] | None:
+        """Build a signal with real ATR-based SL/TP and futures data filters."""
+        assert self._client is not None
+        indicators = market_data.get("indicators", {})
         close = float(market_data["close"])
-        direction = random.choice(["LONG", "SHORT"])  # noqa: S311
+        atr = float(indicators.get("atr", close * 0.02))
+        ema_crossover = indicators.get("ema_crossover", "NONE")
+        ema50 = float(indicators.get("ema50", 0))
+        ema200 = float(indicators.get("ema200", 1))
+        rsi_div = indicators.get("rsi_divergence", "NONE")
+        macd_hist = float(indicators.get("macd", {}).get("histogram", 0))
 
-        # Wider stops for swing trades (3 % SL, 9 % TP → 3:1 RR)
-        sl_pct = 0.03
-        tp_pct = 0.09
+        # Determine direction
+        if ema_crossover == "BULLISH" or (ema50 > ema200 and rsi_div == "BULLISH_DIV") or (ema50 > ema200 and macd_hist > 0):
+            direction = "LONG"
+        elif ema_crossover == "BEARISH" or (ema50 < ema200 and rsi_div == "BEARISH_DIV") or (ema50 < ema200 and macd_hist < 0):
+            direction = "SHORT"
+        else:
+            return None  # No clear direction
+
+        # SL = 2.5x ATR; TP = 2x SL (minimum 2:1 RR)
+        sl_distance = atr * 2.5
+        tp_distance = sl_distance * 2.0
+
+        if sl_distance <= 0:
+            return None
 
         if direction == "LONG":
-            stop_loss = round(close * (1 - sl_pct), 6)
-            take_profit = round(close * (1 + tp_pct), 6)
+            stop_loss = round(close - sl_distance, 6)
+            take_profit = round(close + tp_distance, 6)
         else:
-            stop_loss = round(close * (1 + sl_pct), 6)
-            take_profit = round(close * (1 - tp_pct), 6)
+            stop_loss = round(close + sl_distance, 6)
+            take_profit = round(close - tp_distance, 6)
+
+        # Validate minimum 2:1 RR
+        risk = abs(close - stop_loss)
+        reward = abs(take_profit - close)
+        if risk <= 0 or (reward / risk) < 2.0:
+            return None
+
+        # Base confidence from EMA alignment and divergence signals
+        confidence = 0.58
+        if ema_crossover != "NONE":
+            confidence += 0.10
+        if rsi_div in ("BULLISH_DIV", "BEARISH_DIV"):
+            confidence += 0.08
+
+        # Fetch futures data
+        funding_rate, oi_data, ls_data = None, None, None
+        try:
+            funding_rate = await self._client.fetch_funding_rate(pair)
+            oi_data = await self._client.fetch_open_interest(pair)
+            ls_data = await self._client.fetch_long_short_ratio(pair)
+        except Exception as exc:
+            logger.debug("Failed to fetch futures data for %s: %s", pair, exc)
+
+        # Funding rate filter
+        if funding_rate is not None:
+            fr = float(funding_rate)
+            if direction == "LONG" and fr > 0.0005:
+                confidence -= 0.20
+            elif direction == "SHORT" and fr < -0.0005:
+                confidence -= 0.20
+
+        # Open interest filter
+        if oi_data is not None:
+            oi_change = float(oi_data.get("change_pct", 0))
+            if (direction == "LONG" and oi_change > 0) or (direction == "SHORT" and oi_change < 0):
+                confidence += 0.10
+
+        # Long/short ratio filter
+        if ls_data is not None:
+            ls_ratio = float(ls_data.get("long_short_ratio", 1.0))
+            if direction == "LONG" and ls_ratio > 2.0:
+                confidence -= 0.15
+
+        # Minimum confidence gate
+        confidence = round(min(0.95, max(0.0, confidence)), 4)
+        if confidence < _MIN_CONFIDENCE:
+            logger.debug("SwingEngine: confidence %.2f below gate for %s — skipped", confidence, pair)
+            return None
 
         return {
-            "pair": market_data["pair"],
+            "pair": pair,
             "engine": "swing",
             "timeframe": market_data["timeframe"],
             "direction": direction,
             "entry": round(close, 6),
             "stop_loss": stop_loss,
             "take_profit": take_profit,
-            "confidence": round(random.uniform(0.5, 0.9), 2),  # noqa: S311
-            "reasoning": "Stub swing signal — replace with real analysis.",
-            "market_data": market_data,
+            "confidence": confidence,
+            "reasoning": (
+                f"EMA50/200 {'bullish' if ema50 > ema200 else 'bearish'} "
+                f"({ema_crossover}), RSI div: {rsi_div}, MACD hist: {macd_hist:.4f}"
+            ),
+            "market_data": {
+                **market_data,
+                "futures": {
+                    "funding_rate": funding_rate,
+                    "open_interest": oi_data,
+                    "long_short_ratio": ls_data,
+                },
+            },
         }

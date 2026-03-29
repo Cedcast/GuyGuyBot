@@ -24,9 +24,9 @@ class BaseEngine(ABC):
         List of timeframe strings relevant to this engine, e.g. ``["1m", "5m"]``.
     """
 
-    def __init__(self, pairs: list[str], timeframes: list[str]) -> None:
+    def __init__(self, pairs: list[str], timeframes: list[str] | None = None) -> None:
         self._pairs = pairs
-        self._timeframes = timeframes
+        self._timeframes = timeframes or []
 
     @property
     @abstractmethod

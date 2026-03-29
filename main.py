@@ -9,10 +9,11 @@ Startup sequence
 2. Initialise SQLite database
 3. Create SignalLogger and RiskGate
 4. Build the LLM AgentPipeline
-5. Instantiate the trade engines
-6. Start the Telegram bot
-7. Start APScheduler
-8. Run all scan loops and the bot concurrently in a single asyncio event loop
+5. Instantiate ExchangeClient and SentimentFetcher
+6. Instantiate the trade engines (wired to ExchangeClient)
+7. Start the Telegram bot
+8. Start APScheduler
+9. Run all scan loops and the bot concurrently in a single asyncio event loop
 """
 
 from __future__ import annotations
@@ -29,8 +30,10 @@ from agents.pipeline import build_pipeline
 from core.config import load_config
 from core.database import Database
 from core.signal_logger import SignalLogger
+from data.exchange_client import ExchangeClient
 from engines.scalping_engine import ScalpingEngine
 from engines.swing_engine import SwingEngine
+from news.sentiment import SentimentFetcher
 from risk.gating import RiskGate
 from telegram.bot import GuyGuyBot
 
@@ -60,17 +63,32 @@ async def _engine_loop(
     risk_gate: RiskGate,
     bot: GuyGuyBot,
     scan_interval: int,
+    sentiment_fetcher: SentimentFetcher | None = None,
 ) -> None:
     """Continuously run *engine*.scan() every *scan_interval* seconds.
 
     For each candidate signal that passes risk gating, the agent pipeline
     is invoked.  A confirmed signal is logged and sent to Telegram.
+    News context is fetched once per scan cycle and injected into each
+    pipeline call.
     """
     name = engine.engine_name
     logger.info("Engine loop started: %s (interval=%ds)", name, scan_interval)
 
     while True:
         try:
+            # Fetch news context once per scan cycle
+            news_context: dict[str, Any] = {}
+            if sentiment_fetcher is not None:
+                try:
+                    pairs = engine.get_pairs()
+                    news_context = await sentiment_fetcher.get_market_context(pairs)
+                    logger.debug("News context fetched: F&G=%s, sentiment=%.2f",
+                                 news_context.get("fear_greed_index"),
+                                 news_context.get("market_sentiment_score", 0))
+                except Exception as exc:
+                    logger.warning("Failed to fetch news context: %s", exc)
+
             candidates = await engine.scan()
 
             for candidate in candidates:
@@ -82,7 +100,8 @@ async def _engine_loop(
                     continue
 
                 market_data = candidate.get("market_data", candidate)
-                final_signal = await pipeline.run_pipeline(market_data)
+                context = {"news_context": news_context}
+                final_signal = await pipeline.run_pipeline(market_data, context=context)
 
                 if final_signal is None:
                     logger.debug("No actionable signal for %s/%s", pair, engine_name)
@@ -95,6 +114,9 @@ async def _engine_loop(
                     "pair": pair,
                     "engine": engine_name,
                 }
+                # Attach news context to signal for Telegram message formatting
+                if news_context:
+                    full_signal["news_context"] = news_context
 
                 signal_id = signal_logger.log_signal(full_signal)
                 full_signal["signal_id"] = signal_id
@@ -119,20 +141,17 @@ async def _trade_monitor_loop(
     signal_logger: SignalLogger,
     risk_gate: RiskGate,
     bot: GuyGuyBot,
+    exchange_client: ExchangeClient,
     poll_interval: int = 30,
 ) -> None:
-    """Periodically check open trades for TP/SL hits.
-
-    **Stub**: the close price is fetched from a placeholder; replace with
-    a real Binance price call to make this functional.
-    """
+    """Periodically check open trades for TP/SL hits using live prices."""
     logger.info("Trade monitor loop started (poll_interval=%ds)", poll_interval)
 
     while True:
         try:
             open_trades = signal_logger.get_open_trades()
             for trade in open_trades:
-                close_price = await _fetch_current_price(trade["pair"])
+                close_price = await exchange_client.fetch_current_price(trade["pair"])
                 if close_price is None:
                     continue
 
@@ -149,23 +168,6 @@ async def _trade_monitor_loop(
             logger.exception("Trade monitor error: %s", exc)
 
         await asyncio.sleep(poll_interval)
-
-
-async def _fetch_current_price(pair: str) -> float | None:
-    """Fetch the current mark price for *pair* from Binance.
-
-    **Stub** — returns ``None`` (no real price fetching yet).
-
-    To implement, call the Binance REST API::
-
-        async with aiohttp.ClientSession() as session:
-            url = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={pair}"
-            async with session.get(url) as resp:
-                data = await resp.json()
-                return float(data["price"])
-    """
-    # TODO: Replace with real Binance price fetch.
-    return None
 
 
 def _check_trade_outcome(trade: dict[str, Any], current_price: float) -> str | None:
@@ -198,6 +200,13 @@ async def main() -> None:
     config = load_config()
     logger.info("Config loaded — pairs: %s", config.trading.pairs)
 
+    # Paper trading warning
+    if config.paper_trading.enabled:
+        logger.warning("=" * 60)
+        logger.warning("PAPER TRADING MODE ENABLED — no real orders will be placed")
+        logger.warning(config.paper_trading.note)
+        logger.warning("=" * 60)
+
     # 2. Database
     db = Database(config.database.path)
     db.initialize()
@@ -213,7 +222,17 @@ async def main() -> None:
     # 4. Agent pipeline
     pipeline = build_pipeline(config.llm)
 
-    # 5. Trade engines
+    # 5. ExchangeClient + SentimentFetcher
+    exchange_client = ExchangeClient()
+    sentiment_fetcher: SentimentFetcher | None = None
+    if config.news.enabled:
+        sentiment_fetcher = SentimentFetcher(
+            cryptopanic_token=config.news.cryptopanic_token,
+            cache_ttl=config.news.cache_ttl_seconds,
+        )
+        logger.info("News/sentiment fetcher enabled")
+
+    # 6. Trade engines (wired to ExchangeClient)
     engines_tasks: list[asyncio.Task] = []
     active_engines = []
 
@@ -221,6 +240,7 @@ async def main() -> None:
         scalping = ScalpingEngine(
             pairs=config.trading.pairs,
             timeframes=config.engines.scalping.timeframes,
+            exchange_client=exchange_client,
         )
         active_engines.append((scalping, config.engines.scalping.scan_interval))
 
@@ -228,28 +248,29 @@ async def main() -> None:
         swing = SwingEngine(
             pairs=config.trading.pairs,
             timeframes=config.engines.swing.timeframes,
+            exchange_client=exchange_client,
         )
         active_engines.append((swing, config.engines.swing.scan_interval))
 
-    # 6. Telegram bot
+    # 7. Telegram bot
     bot = GuyGuyBot(config=config, signal_logger=signal_logger, risk_gate=risk_gate)
     await bot.start_polling()
 
-    # 7. APScheduler
+    # 8. APScheduler
     scheduler = AsyncIOScheduler(timezone="UTC")
     bot.setup_scheduler(scheduler)
     scheduler.start()
 
-    # 8. Launch all tasks
+    # 9. Launch all tasks
     for eng, interval in active_engines:
         task = asyncio.create_task(
-            _engine_loop(eng, pipeline, signal_logger, risk_gate, bot, interval),
+            _engine_loop(eng, pipeline, signal_logger, risk_gate, bot, interval, sentiment_fetcher),
             name=f"engine_{eng.engine_name}",
         )
         engines_tasks.append(task)
 
     monitor_task = asyncio.create_task(
-        _trade_monitor_loop(signal_logger, risk_gate, bot),
+        _trade_monitor_loop(signal_logger, risk_gate, bot, exchange_client),
         name="trade_monitor",
     )
 
@@ -274,6 +295,9 @@ async def main() -> None:
 
     scheduler.shutdown(wait=False)
     await bot.stop()
+    if sentiment_fetcher is not None:
+        await sentiment_fetcher.close()
+    await exchange_client.close()
     logger.info("GuyGuyBot stopped cleanly")
 
 

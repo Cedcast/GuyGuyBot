@@ -86,7 +86,8 @@ class AgentPipeline:
         market_data:
             Market snapshot dict (pair, timeframe, ohlcv, indicators …).
         context:
-            Optional extra context forwarded to each agent.
+            Optional extra context forwarded to each agent.  Include a
+            ``news_context`` key to inject real-time sentiment data.
 
         Returns
         -------
@@ -177,7 +178,7 @@ def build_pipeline(config_llm: Any) -> AgentPipeline:
 
     _agent_classes = {
         "claude": (ClaudeAgent, config_llm.claude_api_key),
-        "gpt5": (GPTAgent, config_llm.gpt5_api_key),
+        "gpt4o": (GPTAgent, config_llm.gpt4o_api_key),
         "grok": (GrokAgent, config_llm.grok_api_key),
     }
 

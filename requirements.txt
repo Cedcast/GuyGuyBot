@@ -4,3 +4,4 @@ aiohttp>=3.9
 apscheduler>=3.10
 anthropic>=0.25.0
 openai>=1.30.0
+pandas>=2.0.0

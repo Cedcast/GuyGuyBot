@@ -1,5 +1,6 @@
 # Central configuration for GuyGuyBot
 # Replace all placeholder values before running.
+# API keys can also be set via environment variables (see .env.example).
 
 telegram:
   bot_token: "YOUR_BOT_TOKEN_HERE"
@@ -35,10 +36,22 @@ engines:
     scan_interval: 3600   # seconds between scans
 
 llm:
-  # Available models: claude, gpt5, grok
-  primary_agents: ["claude", "gpt5"]   # Two agents run per signal
-  arbitration_agent: "grok"             # Third agent for arbitration/summaries
-  # API keys - replace with your actual keys
+  # Available models: claude, gpt4o, grok
+  primary_agents: ["claude", "gpt4o"]   # Two agents run per signal
+  arbitration_agent: "grok"              # Third agent for arbitration/summaries
+  # API keys - replace with your actual keys or set via environment variables
   claude_api_key: "YOUR_CLAUDE_API_KEY"
-  gpt5_api_key: "YOUR_GPT5_API_KEY"
+  gpt4o_api_key: "YOUR_GPT4O_API_KEY"
   grok_api_key: "YOUR_GROK_API_KEY"
+
+news:
+  enabled: true
+  cache_ttl_seconds: 300
+  cryptopanic_token: "Pub"   # Public token, no key needed
+  sentiment_warning_threshold: -0.5
+  fear_greed_warning_threshold: 20
+
+paper_trading:
+  enabled: true
+  start_date: null    # set at runtime
+  note: "30-day paper trading period. No real orders executed."
