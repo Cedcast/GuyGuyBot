@@ -1,0 +1,29 @@
+services:
+  - type: worker
+    name: guyguybot
+    env: python
+    region: oregon
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: CLAUDE_API_KEY
+        sync: false
+      - key: GPT4O_API_KEY
+        sync: false
+      - key: GROK_API_KEY
+        sync: false
+      - key: CRYPTOPANIC_TOKEN
+        value: Pub
+      - key: LUNARCRUSH_API_KEY
+        sync: false
+      - key: DATABASE_PATH
+        value: /data/guybot.db
+    disk:
+      name: guybot-db
+      mountPath: /data
+      sizeGB: 1

@@ -1,78 +1,77 @@
 """
 data/exchange_client.py
 -----------------------
-Async multi-exchange OHLCV and price fetcher.
-Primary: Binance Futures REST API (no auth required for public endpoints).
-Fallback: ccxt with Bybit and OKX.
+MultiExchangeClient — aggregates price, OHLCV, and futures data
+across Binance, Bybit, OKX, and Kraken concurrently.
+
+All exchange APIs used are public endpoints — no API keys required.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from typing import Any
 
-import aiohttp
+from data.exchanges.binance import BinanceExchange
+from data.exchanges.bybit import BybitExchange
+from data.exchanges.kraken import KrakenExchange
+from data.exchanges.okx import OKXExchange
 
 logger = logging.getLogger(__name__)
 
-# Binance Futures base URLs
-_FAPI_BASE = "https://fapi.binance.com/fapi/v1"
-_FDATA_BASE = "https://fapi.binance.com/futures/data"
+_ALL_EXCHANGES = ["binance", "bybit", "okx", "kraken"]
+# Futures-capable exchanges (have funding rate, OI, L/S)
+_FUTURES_EXCHANGES = ["binance", "bybit", "okx"]
 
-# Cache TTL in seconds
-_PRICE_CACHE_TTL = 10
+# Threshold for price divergence warning (0.1%)
+_PRICE_DIVERGENCE_WARN = 0.001
 
-# Map generic timeframe strings to Binance kline intervals
-_TF_MAP: dict[str, str] = {
-    "1m": "1m",
-    "5m": "5m",
-    "15m": "15m",
-    "30m": "30m",
-    "1h": "1h",
-    "2h": "2h",
-    "4h": "4h",
-    "6h": "6h",
-    "12h": "12h",
-    "1d": "1d",
-    "1w": "1w",
-}
+# Backward-compat alias so existing ``from data.exchange_client import ExchangeClient``
+# imports keep working.
+ExchangeClient = None  # replaced at bottom of file after class definition
 
 
-class ExchangeClient:
-    """Async client for Binance Futures public REST endpoints.
-
-    All methods return ``None`` (or safe defaults) on failure — they never
-    raise so callers can proceed without crashing on transient API errors.
+class MultiExchangeClient:
+    """Orchestrates all 4 exchanges and aggregates their data.
 
     Parameters
     ----------
-    session:
-        Optional shared :class:`aiohttp.ClientSession`.  If not provided, a
-        new session is created on the first request and reused throughout the
-        lifetime of this instance.
+    enabled_exchanges:
+        List of exchange names to use.  Defaults to all 4.
+    ohlcv_source:
+        Which exchange to use as primary OHLCV source.  Default ``"binance"``.
     """
 
-    def __init__(self, session: aiohttp.ClientSession | None = None) -> None:
-        self._external_session = session
-        self._session: aiohttp.ClientSession | None = session
-        # In-memory price cache: {pair: (price, timestamp)}
-        self._price_cache: dict[str, tuple[float, float]] = {}
-        # Previous OI values for change-pct calculation: {pair: float}
-        self._prev_oi: dict[str, float] = {}
+    def __init__(
+        self,
+        enabled_exchanges: list[str] | None = None,
+        ohlcv_source: str = "binance",
+    ) -> None:
+        names = enabled_exchanges or _ALL_EXCHANGES
+        self._ohlcv_source = ohlcv_source
 
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10)
-            )
-        return self._session
+        # Instantiate requested exchanges
+        _factory = {
+            "binance": BinanceExchange,
+            "bybit": BybitExchange,
+            "okx": OKXExchange,
+            "kraken": KrakenExchange,
+        }
+        self._exchanges: dict[str, Any] = {}
+        for name in names:
+            if name in _factory:
+                self._exchanges[name] = _factory[name]()
+            else:
+                logger.warning("MultiExchangeClient: unknown exchange %r — skipped", name)
 
-    async def close(self) -> None:
-        """Close the underlying HTTP session if we own it."""
-        if self._session and not self._external_session:
-            await self._session.close()
+        # OHLCV fallback order (skip exchanges not in self._exchanges)
+        self._ohlcv_order = [ohlcv_source] + [
+            n for n in ["binance", "bybit", "okx"] if n != ohlcv_source
+        ]
+
+        # Previous OI totals for change-pct calculation: {pair: float}
+        self._prev_oi_total: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # OHLCV
@@ -84,175 +83,242 @@ class ExchangeClient:
         timeframe: str,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
-        """Fetch OHLCV candles from Binance Futures.
-
-        Parameters
-        ----------
-        pair:
-            e.g. ``"BTCUSDT"``
-        timeframe:
-            e.g. ``"15m"``
-        limit:
-            Number of candles to retrieve (max 1500).
+        """Fetch OHLCV from the primary source; fall back to next available.
 
         Returns
         -------
-        A list of dicts with keys ``open``, ``high``, ``low``, ``close``,
-        ``volume``, ``timestamp`` — or an empty list on failure.
+        List of ``{timestamp, open, high, low, close, volume}`` dicts or
+        an empty list on total failure.
         """
-        interval = _TF_MAP.get(timeframe, timeframe)
-        url = f"{_FAPI_BASE}/klines"
-        params = {"symbol": pair, "interval": interval, "limit": limit}
-        try:
-            session = await self._get_session()
-            async with session.get(url, params=params) as resp:
-                resp.raise_for_status()
-                raw: list[list] = await resp.json()
-            return [
-                {
-                    "timestamp": int(k[0]),
-                    "open": float(k[1]),
-                    "high": float(k[2]),
-                    "low": float(k[3]),
-                    "close": float(k[4]),
-                    "volume": float(k[5]),
-                }
-                for k in raw
-            ]
-        except Exception as exc:
-            logger.warning("fetch_ohlcv %s/%s failed: %s", pair, timeframe, exc)
-            return []
+        for name in self._ohlcv_order:
+            ex = self._exchanges.get(name)
+            if ex is None:
+                continue
+            candles = await ex.fetch_ohlcv(pair, timeframe, limit)
+            if candles:
+                return candles
+            logger.debug("MultiExchangeClient: OHLCV fallback from %s for %s/%s", name, pair, timeframe)
+        return []
 
     # ------------------------------------------------------------------
-    # Current price
+    # Current price — averaged across all exchanges
     # ------------------------------------------------------------------
 
     async def fetch_current_price(self, pair: str) -> float | None:
-        """Fetch the latest mark price from Binance Futures ticker.
+        """Fetch price from all exchanges concurrently; return average."""
+        exchange_names = list(self._exchanges.keys())
+        tasks = [self._exchanges[n].fetch_current_price(pair) for n in exchange_names]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        Uses a 10-second in-memory cache to avoid hammering the API.
+        prices: dict[str, float] = {}
+        for name, result in zip(exchange_names, results):
+            if isinstance(result, Exception) or result is None:
+                continue
+            prices[name] = float(result)
+
+        if not prices:
+            return None
+
+        avg = sum(prices.values()) / len(prices)
+
+        # Log divergences > 0.1%
+        for name, price in prices.items():
+            if avg > 0 and abs(price - avg) / avg > _PRICE_DIVERGENCE_WARN:
+                logger.warning(
+                    "Price divergence for %s on %s: %.2f vs avg %.2f (%.3f%%)",
+                    pair, name, price, avg,
+                    abs(price - avg) / avg * 100,
+                )
+
+        return avg
+
+    # ------------------------------------------------------------------
+    # Aggregated futures data
+    # ------------------------------------------------------------------
+
+    async def fetch_aggregated_futures_data(self, pair: str) -> dict[str, Any]:
+        """Fetch and aggregate futures data across all futures exchanges.
+
+        Returns a rich dict with per-exchange and aggregated values.
+        Returns safe defaults for any exchange that fails.
         """
-        now = time.monotonic()
-        cached = self._price_cache.get(pair)
-        if cached and (now - cached[1]) < _PRICE_CACHE_TTL:
-            return cached[0]
+        futures_exchanges = [
+            n for n in _FUTURES_EXCHANGES if n in self._exchanges
+        ]
+        all_exchanges = list(self._exchanges.keys())
 
-        url = f"{_FAPI_BASE}/ticker/price"
-        params = {"symbol": pair}
-        try:
-            session = await self._get_session()
-            async with session.get(url, params=params) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-            price = float(data["price"])
-            self._price_cache[pair] = (price, now)
-            return price
-        except Exception as exc:
-            logger.warning("fetch_current_price %s failed: %s", pair, exc)
-            return None
+        # Fetch concurrently: funding rates, OI, L/S, and prices
+        fr_tasks = [self._exchanges[n].fetch_funding_rate(pair) for n in futures_exchanges]
+        oi_tasks = [self._exchanges[n].fetch_open_interest(pair) for n in futures_exchanges]
+        ls_tasks = [self._exchanges[n].fetch_long_short_ratio(pair) for n in futures_exchanges]
+        price_tasks = [self._exchanges[n].fetch_current_price(pair) for n in all_exchanges]
+
+        fr_results, oi_results, ls_results, price_results = await asyncio.gather(
+            asyncio.gather(*fr_tasks, return_exceptions=True),
+            asyncio.gather(*oi_tasks, return_exceptions=True),
+            asyncio.gather(*ls_tasks, return_exceptions=True),
+            asyncio.gather(*price_tasks, return_exceptions=True),
+        )
+
+        result: dict[str, Any] = {}
+
+        # ---- Funding rates ----
+        funding_rates: list[float] = []
+        for name, fr in zip(futures_exchanges, fr_results):
+            if isinstance(fr, Exception) or fr is None:
+                result[f"funding_rate_{name}"] = None
+            else:
+                val = float(fr)
+                result[f"funding_rate_{name}"] = val
+                funding_rates.append(val)
+
+        if funding_rates:
+            result["funding_rate_avg"] = sum(funding_rates) / len(funding_rates)
+            result["funding_rate_max"] = max(funding_rates)
+            result["funding_rate_min"] = min(funding_rates)
+        else:
+            result["funding_rate_avg"] = None
+            result["funding_rate_max"] = None
+            result["funding_rate_min"] = None
+
+        # ---- Open interest ----
+        oi_values: list[float] = []
+        for name, oi in zip(futures_exchanges, oi_results):
+            if isinstance(oi, Exception) or oi is None:
+                result[f"oi_{name}"] = None
+            else:
+                val = float(oi.get("oi", 0))
+                result[f"oi_{name}"] = val
+                oi_values.append(val)
+
+        oi_total = sum(oi_values) if oi_values else 0.0
+        result["oi_total"] = oi_total
+        prev_oi = self._prev_oi_total.get(pair)
+        result["oi_change_pct"] = ((oi_total - prev_oi) / prev_oi * 100) if prev_oi else 0.0
+        if oi_total > 0:
+            self._prev_oi_total[pair] = oi_total
+
+        # ---- Long/Short ratios ----
+        ls_ratios: list[float] = []
+        for name, ls in zip(futures_exchanges, ls_results):
+            if isinstance(ls, Exception) or ls is None:
+                result[f"ls_ratio_{name}"] = None
+            else:
+                val = float(ls.get("long_short_ratio", 1.0))
+                result[f"ls_ratio_{name}"] = val
+                ls_ratios.append(val)
+
+        result["ls_ratio_avg"] = sum(ls_ratios) / len(ls_ratios) if ls_ratios else None
+
+        # ---- Prices ----
+        valid_prices: dict[str, float] = {}
+        for name, price in zip(all_exchanges, price_results):
+            if isinstance(price, Exception) or price is None:
+                result[f"price_{name}"] = None
+            else:
+                val = float(price)
+                result[f"price_{name}"] = val
+                valid_prices[name] = val
+
+        if valid_prices:
+            avg_price = sum(valid_prices.values()) / len(valid_prices)
+            result["price_avg"] = avg_price
+            if avg_price > 0:
+                max_price = max(valid_prices.values())
+                min_price = min(valid_prices.values())
+                result["price_divergence_pct"] = (max_price - min_price) / avg_price * 100
+            else:
+                result["price_divergence_pct"] = 0.0
+        else:
+            result["price_avg"] = None
+            result["price_divergence_pct"] = 0.0
+
+        # ---- Exchange consensus ----
+        fr_avg = result.get("funding_rate_avg")
+        ls_avg = result.get("ls_ratio_avg")
+        oi_change = result.get("oi_change_pct", 0.0)
+
+        if (
+            fr_avg is not None
+            and ls_avg is not None
+            and fr_avg > 0.0005
+            and oi_change > 0
+            and ls_avg > 1.3
+        ):
+            consensus = "BULLISH"
+        elif (
+            fr_avg is not None
+            and fr_avg < -0.0002
+        ) or (
+            ls_avg is not None
+            and ls_avg < 0.8
+            and oi_change > 0
+        ):
+            consensus = "BEARISH"
+        else:
+            consensus = "NEUTRAL"
+        result["exchange_consensus"] = consensus
+
+        return result
 
     # ------------------------------------------------------------------
-    # Funding rate
-    # ------------------------------------------------------------------
-
-    async def fetch_funding_rate(self, pair: str) -> float | None:
-        """Fetch the current funding rate from Binance Futures premium index."""
-        url = f"{_FAPI_BASE}/premiumIndex"
-        params = {"symbol": pair}
-        try:
-            session = await self._get_session()
-            async with session.get(url, params=params) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-            return float(data["lastFundingRate"])
-        except Exception as exc:
-            logger.warning("fetch_funding_rate %s failed: %s", pair, exc)
-            return None
-
-    # ------------------------------------------------------------------
-    # Open interest
-    # ------------------------------------------------------------------
-
-    async def fetch_open_interest(self, pair: str) -> dict[str, float] | None:
-        """Fetch open interest and compute change vs. previous fetch.
-
-        Returns
-        -------
-        ``{oi: float, change_pct: float}`` or ``None`` on failure.
-        ``change_pct`` is positive when OI is growing.
-        """
-        url = f"{_FAPI_BASE}/openInterest"
-        params = {"symbol": pair}
-        try:
-            session = await self._get_session()
-            async with session.get(url, params=params) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-            oi = float(data["openInterest"])
-            prev = self._prev_oi.get(pair)
-            change_pct = ((oi - prev) / prev * 100) if prev else 0.0
-            self._prev_oi[pair] = oi
-            return {"oi": oi, "change_pct": change_pct}
-        except Exception as exc:
-            logger.warning("fetch_open_interest %s failed: %s", pair, exc)
-            return None
-
-    # ------------------------------------------------------------------
-    # Long/Short ratio
-    # ------------------------------------------------------------------
-
-    async def fetch_long_short_ratio(self, pair: str) -> dict[str, float] | None:
-        """Fetch global long/short account ratio (5-minute period).
-
-        Returns
-        -------
-        ``{long_short_ratio: float, long_account: float, short_account: float}``
-        or ``None`` on failure.
-        """
-        url = f"{_FDATA_BASE}/globalLongShortAccountRatio"
-        params = {"symbol": pair, "period": "5m", "limit": 1}
-        try:
-            session = await self._get_session()
-            async with session.get(url, params=params) as resp:
-                resp.raise_for_status()
-                data: list[dict] = await resp.json()
-            if not data:
-                return None
-            row = data[0]
-            return {
-                "long_short_ratio": float(row["longShortRatio"]),
-                "long_account": float(row["longAccount"]),
-                "short_account": float(row["shortAccount"]),
-            }
-        except Exception as exc:
-            logger.warning("fetch_long_short_ratio %s failed: %s", pair, exc)
-            return None
-
-    # ------------------------------------------------------------------
-    # Order book depth
+    # Order book depth — Binance only (most liquid)
     # ------------------------------------------------------------------
 
     async def fetch_order_book_depth(self, pair: str) -> dict[str, float] | None:
-        """Fetch order book and return aggregated bid/ask walls.
-
-        Returns
-        -------
-        ``{bid_wall: float, ask_wall: float, bid_ask_ratio: float}``
-        or ``None`` on failure.
-        """
-        url = f"{_FAPI_BASE}/depth"
-        params = {"symbol": pair, "limit": 20}
-        try:
-            session = await self._get_session()
-            async with session.get(url, params=params) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-            bids: list[list[str]] = data.get("bids", [])
-            asks: list[list[str]] = data.get("asks", [])
-            bid_wall = sum(float(b[1]) for b in bids)
-            ask_wall = sum(float(a[1]) for a in asks)
-            ratio = bid_wall / ask_wall if ask_wall > 0 else 1.0
-            return {"bid_wall": bid_wall, "ask_wall": ask_wall, "bid_ask_ratio": ratio}
-        except Exception as exc:
-            logger.warning("fetch_order_book_depth %s failed: %s", pair, exc)
+        """Fetch order book depth from Binance (most liquid, lowest latency)."""
+        ex = self._exchanges.get("binance")
+        if ex is None:
+            # Fallback to first available exchange
+            for name in self._exchanges:
+                ex = self._exchanges[name]
+                break
+        if ex is None:
             return None
+        return await ex.fetch_order_book_depth(pair)
+
+    # ------------------------------------------------------------------
+    # Backward-compatible single-value methods
+    # ------------------------------------------------------------------
+
+    async def fetch_funding_rate(self, pair: str) -> float | None:
+        """Return average funding rate across all futures exchanges."""
+        data = await self.fetch_aggregated_futures_data(pair)
+        return data.get("funding_rate_avg")
+
+    async def fetch_open_interest(self, pair: str) -> dict[str, float] | None:
+        """Return aggregated OI for backward compatibility."""
+        data = await self.fetch_aggregated_futures_data(pair)
+        oi_total = data.get("oi_total")
+        if oi_total is None:
+            return None
+        return {"oi": oi_total, "change_pct": data.get("oi_change_pct", 0.0)}
+
+    async def fetch_long_short_ratio(self, pair: str) -> dict[str, float] | None:
+        """Return averaged long/short ratio for backward compatibility."""
+        data = await self.fetch_aggregated_futures_data(pair)
+        ls_avg = data.get("ls_ratio_avg")
+        if ls_avg is None:
+            return None
+        return {
+            "long_short_ratio": ls_avg,
+            "long_account": ls_avg / (1 + ls_avg),
+            "short_account": 1 / (1 + ls_avg),
+        }
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def close(self) -> None:
+        """Close all exchange sessions."""
+        await asyncio.gather(
+            *[ex.close() for ex in self._exchanges.values()],
+            return_exceptions=True,
+        )
+
+
+# Backward-compat alias — existing code that does
+#   ``from data.exchange_client import ExchangeClient``
+# will get MultiExchangeClient.
+ExchangeClient = MultiExchangeClient

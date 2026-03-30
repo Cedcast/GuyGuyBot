@@ -55,6 +55,13 @@ class DatabaseConfig:
 
 
 @dataclass
+class ExchangeConfig:
+    enabled: list[str] = field(default_factory=lambda: ["binance", "bybit", "okx", "kraken"])
+    ohlcv_source: str = "binance"
+    price_aggregation: str = "average"
+
+
+@dataclass
 class TradingConfig:
     pairs: list[str] = field(default_factory=list)
     risk_per_trade: float = 0.01
@@ -94,6 +101,7 @@ class NewsConfig:
     enabled: bool = True
     cache_ttl_seconds: int = 300
     cryptopanic_token: str = "Pub"
+    lunarcrush_api_key: str = ""
     sentiment_warning_threshold: float = -0.5
     fear_greed_warning_threshold: int = 20
 
@@ -114,6 +122,7 @@ class Config:
     trading: TradingConfig
     engines: EnginesConfig
     llm: LLMConfig
+    exchanges: ExchangeConfig = field(default_factory=ExchangeConfig)
     news: NewsConfig = field(default_factory=NewsConfig)
     paper_trading: PaperTradingConfig = field(default_factory=PaperTradingConfig)
 
@@ -153,11 +162,20 @@ def _parse_engines(raw: dict[str, Any]) -> EnginesConfig:
     )
 
 
+def _parse_exchanges(raw: dict[str, Any]) -> ExchangeConfig:
+    return ExchangeConfig(
+        enabled=raw.get("enabled", ["binance", "bybit", "okx", "kraken"]),
+        ohlcv_source=raw.get("ohlcv_source", "binance"),
+        price_aggregation=raw.get("price_aggregation", "average"),
+    )
+
+
 def _parse_news(raw: dict[str, Any]) -> NewsConfig:
     return NewsConfig(
         enabled=raw.get("enabled", True),
         cache_ttl_seconds=int(raw.get("cache_ttl_seconds", 300)),
         cryptopanic_token=raw.get("cryptopanic_token", "Pub"),
+        lunarcrush_api_key=os.environ.get("LUNARCRUSH_API_KEY") or raw.get("lunarcrush_api_key", ""),
         sentiment_warning_threshold=float(raw.get("sentiment_warning_threshold", -0.5)),
         fear_greed_warning_threshold=int(raw.get("fear_greed_warning_threshold", 20)),
     )
@@ -197,6 +215,7 @@ def load_config(path: Path | str = CONFIG_PATH) -> Config:
     trading_raw = raw.get("trading", {})
     llm_raw = raw.get("llm", {})
     news_raw = raw.get("news", {})
+    exchanges_raw = raw.get("exchanges", {})
     pt_raw = raw.get("paper_trading", {})
 
     # Resolve LLM API keys: env vars take precedence over config.yaml
@@ -204,15 +223,19 @@ def load_config(path: Path | str = CONFIG_PATH) -> Config:
     gpt4o_key = os.environ.get("GPT4O_API_KEY") or llm_raw.get("gpt4o_api_key", "")
     grok_key = os.environ.get("GROK_API_KEY") or llm_raw.get("grok_api_key", "")
 
+    # Database path: env var overrides config.yaml
+    db_path = os.environ.get("DATABASE_PATH") or db_raw.get("path", "data/guybot.db")
+
     return Config(
         telegram=telegram,
-        database=DatabaseConfig(path=db_raw.get("path", "data/guybot.db")),
+        database=DatabaseConfig(path=db_path),
         trading=TradingConfig(
             pairs=trading_raw.get("pairs", []),
             risk_per_trade=float(trading_raw.get("risk_per_trade", 0.01)),
             account_size=float(trading_raw.get("account_size", 1000.0)),
         ),
         engines=_parse_engines(raw.get("engines", {})),
+        exchanges=_parse_exchanges(exchanges_raw),
         llm=LLMConfig(
             screener_agents=llm_raw.get("screener_agents", ["gpt4o", "grok"]),
             decision_agent=llm_raw.get("decision_agent", "claude"),

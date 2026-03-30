@@ -5,6 +5,8 @@ Fetches real-time crypto news sentiment and market fear/greed index.
 Sources:
   - CryptoPanic public API (no key needed for basic feed)
   - Alternative.me Fear & Greed Index API (free)
+  - LunarCrush social sentiment API (free key from lunarcrush.com)
+  - CoinGlass liquidation data (free public API)
 """
 
 from __future__ import annotations
@@ -17,37 +19,7 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
-# -----------------------------------------------------------------------
-# Simple keyword-based sentiment scoring
-# -----------------------------------------------------------------------
-_POSITIVE_WORDS = {
-    "bull", "bullish", "surge", "surges", "surging",
-    "breakout", "rally", "rallies", "moon", "mooning",
-    "pump", "pumping", "all-time-high", "ath", "gain",
-    "gains", "rise", "rising", "green", "recovery",
-    "adoption", "buy", "long", "outperform",
-}
-_NEGATIVE_WORDS = {
-    "bear", "bearish", "crash", "crashes", "crashing",
-    "dump", "dumping", "plunge", "plunges", "plunging",
-    "fud", "hack", "hacked", "ban", "banned", "sec",
-    "lawsuit", "scam", "fraud", "drop", "drops", "fall",
-    "falling", "red", "loss", "losses", "sell", "short",
-    "liquidation", "exploit",
-}
-
 _CACHE_TTL = 300  # 5 minutes
-
-
-def _score_title(title: str) -> float:
-    """Return a sentiment score in [-1.0, 1.0] based on keyword matching."""
-    words = set(title.lower().split())
-    pos = len(words & _POSITIVE_WORDS)
-    neg = len(words & _NEGATIVE_WORDS)
-    total = pos + neg
-    if total == 0:
-        return 0.0
-    return round((pos - neg) / total, 2)
 
 
 class SentimentFetcher:
@@ -62,15 +34,20 @@ class SentimentFetcher:
         Public CryptoPanic token.  Defaults to ``"Pub"`` (unauthenticated).
     cache_ttl:
         Cache lifetime in seconds.  Defaults to 300 (5 minutes).
+    lunarcrush_api_key:
+        Free LunarCrush API key from lunarcrush.com.  Optional — falls back
+        to neutral defaults when not configured.
     """
 
     def __init__(
         self,
         cryptopanic_token: str = "Pub",
         cache_ttl: int = _CACHE_TTL,
+        lunarcrush_api_key: str = "",
     ) -> None:
         self._token = cryptopanic_token
         self._cache_ttl = cache_ttl
+        self._lunarcrush_key = lunarcrush_api_key
         self._session: aiohttp.ClientSession | None = None
         # Cache entries: {key: (data, timestamp)}
         self._cache: dict[str, tuple[Any, float]] = {}
@@ -155,7 +132,7 @@ class SentimentFetcher:
 
         Returns
         -------
-        List of ``{title, url, source, published_at, sentiment_score}`` dicts.
+        List of ``{title, url, source, published_at}`` dicts.
         Returns an empty list on failure.
         """
         cache_key = f"news_{','.join(currencies or [])}"
@@ -188,7 +165,6 @@ class SentimentFetcher:
                         "url": post.get("url", ""),
                         "source": post.get("source", {}).get("title", ""),
                         "published_at": post.get("published_at", ""),
-                        "sentiment_score": _score_title(title),
                     }
                 )
             self._store_cache(cache_key, results)
@@ -196,6 +172,111 @@ class SentimentFetcher:
         except Exception as exc:
             logger.warning("fetch_crypto_news failed: %s", exc)
             return []
+
+    # ------------------------------------------------------------------
+    # LunarCrush social sentiment
+    # ------------------------------------------------------------------
+
+    async def fetch_lunarcrush_sentiment(
+        self,
+        coins: list[str],
+    ) -> dict[str, Any]:
+        """Fetch social sentiment from LunarCrush.
+
+        Uses the free public API v4.  No paid plan needed.
+        Returns galaxy_score (0-100), social_volume, and sentiment label.
+        Falls back to neutral defaults if API key not configured or call fails.
+        """
+        if not self._lunarcrush_key:
+            return {
+                "galaxy_score": 50,
+                "social_volume_24h": 0,
+                "sentiment": "neutral",
+                "source": "unavailable",
+            }
+
+        cache_key = f"lunarcrush_{'_'.join(coins[:5])}"
+        cached = self._from_cache(cache_key)
+        if cached is not None:
+            return cached
+
+        url = "https://lunarcrush.com/api4/public/coins/list/v2"
+        headers = {"Authorization": f"Bearer {self._lunarcrush_key}"}
+        params = {"symbols": ",".join(coins[:5])}
+
+        try:
+            session = await self._get_session()
+            async with session.get(url, headers=headers, params=params) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+
+            items = data.get("data", [])
+            if not items:
+                return {"galaxy_score": 50, "social_volume_24h": 0, "sentiment": "neutral"}
+
+            avg_galaxy = sum(i.get("galaxy_score", 50) for i in items) / len(items)
+            total_social_vol = sum(i.get("social_volume_24h", 0) for i in items)
+
+            sentiment = "bullish" if avg_galaxy > 60 else "bearish" if avg_galaxy < 40 else "neutral"
+
+            result: dict[str, Any] = {
+                "galaxy_score": round(avg_galaxy, 1),
+                "social_volume_24h": total_social_vol,
+                "sentiment": sentiment,
+                "source": "lunarcrush",
+            }
+            self._store_cache(cache_key, result)
+            return result
+        except Exception as exc:
+            logger.warning("fetch_lunarcrush_sentiment failed: %s", exc)
+            return {"galaxy_score": 50, "social_volume_24h": 0, "sentiment": "neutral", "source": "error"}
+
+    # ------------------------------------------------------------------
+    # CoinGlass liquidation data
+    # ------------------------------------------------------------------
+
+    async def fetch_coinglass_liquidations(
+        self,
+        pair: str,
+    ) -> dict[str, Any]:
+        """Fetch liquidation data from CoinGlass.
+
+        Uses the free public API.  Returns estimated USD liquidation values.
+        Falls back to empty dict on failure.
+        """
+        cache_key = f"coinglass_{pair}"
+        cached = self._from_cache(cache_key)
+        if cached is not None:
+            return cached
+
+        url = "https://open-api.coinglass.com/public/v2/liquidation_ex"
+        params = {"symbol": pair, "interval": "h4"}
+
+        try:
+            session = await self._get_session()
+            async with session.get(url, params=params) as resp:
+                if resp.status != 200:
+                    return {}
+                data = await resp.json()
+
+            liq_data = data.get("data", {})
+            long_liq = float(liq_data.get("longLiquidationUsd24h", 0))
+            short_liq = float(liq_data.get("shortLiquidationUsd24h", 0))
+
+            result: dict[str, Any] = {
+                "long_liquidations_24h_usd": long_liq,
+                "short_liquidations_24h_usd": short_liq,
+                "liquidation_bias": (
+                    "longs" if long_liq > short_liq
+                    else "shorts" if short_liq > long_liq
+                    else "neutral"
+                ),
+            }
+            self._store_cache(cache_key, result)
+            return result
+        except Exception as exc:
+            logger.warning("fetch_coinglass_liquidations failed: %s", exc)
+            return {}
 
     # ------------------------------------------------------------------
     # Combined market context
@@ -217,9 +298,15 @@ class SentimentFetcher:
             {
                 "fear_greed_index": 71,
                 "fear_greed_label": "Greed",
-                "market_sentiment_score": 0.4,
-                "recent_headlines": [...],
+                "market_sentiment_score": 0.0,
+                "recent_headlines": [...],   # raw — let Grok interpret
                 "sentiment_warning": False,
+                "lunarcrush_galaxy_score": 65,
+                "lunarcrush_social_volume_24h": 120000,
+                "lunarcrush_sentiment": "bullish",
+                "long_liquidations_24h_usd": 50000000.0,
+                "short_liquidations_24h_usd": 30000000.0,
+                "liquidation_bias": "longs",
             }
         """
         safe_default: dict[str, Any] = {
@@ -228,32 +315,48 @@ class SentimentFetcher:
             "market_sentiment_score": 0.0,
             "recent_headlines": [],
             "sentiment_warning": False,
+            "lunarcrush_galaxy_score": 50,
+            "lunarcrush_social_volume_24h": 0,
+            "lunarcrush_sentiment": "neutral",
+            "long_liquidations_24h_usd": 0,
+            "short_liquidations_24h_usd": 0,
+            "liquidation_bias": "neutral",
         }
 
         # Extract base currencies: "BTCUSDT" → "BTC"
         currencies = [p.replace("USDT", "").replace("BUSD", "") for p in pairs]
+        # Primary pair base for CoinGlass (use first pair)
+        primary_base = currencies[0] if currencies else "BTC"
 
         try:
-            fg, news = await _gather_safe(
+            fg, news, lc, liq = await _gather_safe(
                 self.fetch_fear_greed(),
                 self.fetch_crypto_news(currencies=currencies, limit=10),
+                self.fetch_lunarcrush_sentiment(currencies),
+                self.fetch_coinglass_liquidations(primary_base),
             )
             fg = fg or safe_default
             news = news or []
-
-            # Aggregate sentiment across headlines
-            scores = [item["sentiment_score"] for item in news if "sentiment_score" in item]
-            avg_score = sum(scores) / len(scores) if scores else 0.0
+            lc = lc or {}
+            liq = liq or {}
 
             fg_value = int(fg.get("value", 50))
-            sentiment_warning = avg_score < -0.5 or fg_value < 25
+            sentiment_warning = fg_value < 25
 
             return {
                 "fear_greed_index": fg_value,
                 "fear_greed_label": fg.get("classification", "Neutral"),
-                "market_sentiment_score": round(avg_score, 3),
+                "market_sentiment_score": 0.0,  # kept for backward compat; headlines now passed raw
                 "recent_headlines": [item["title"] for item in news[:5]],
                 "sentiment_warning": sentiment_warning,
+                # LunarCrush social
+                "lunarcrush_galaxy_score": lc.get("galaxy_score", 50),
+                "lunarcrush_social_volume_24h": lc.get("social_volume_24h", 0),
+                "lunarcrush_sentiment": lc.get("sentiment", "neutral"),
+                # CoinGlass liquidations
+                "long_liquidations_24h_usd": liq.get("long_liquidations_24h_usd", 0),
+                "short_liquidations_24h_usd": liq.get("short_liquidations_24h_usd", 0),
+                "liquidation_bias": liq.get("liquidation_bias", "neutral"),
             }
         except Exception as exc:
             logger.warning("get_market_context failed: %s", exc)

@@ -30,7 +30,7 @@ from agents.pipeline import build_pipeline
 from core.config import load_config
 from core.database import Database
 from core.signal_logger import SignalLogger
-from data.exchange_client import ExchangeClient
+from data.exchange_client import MultiExchangeClient
 from engines.scalping_engine import ScalpingEngine
 from engines.swing_engine import SwingEngine
 from news.sentiment import SentimentFetcher
@@ -141,7 +141,7 @@ async def _trade_monitor_loop(
     signal_logger: SignalLogger,
     risk_gate: RiskGate,
     bot: GuyGuyBot,
-    exchange_client: ExchangeClient,
+    exchange_client: MultiExchangeClient,
     poll_interval: int = 30,
 ) -> None:
     """Periodically check open trades for TP/SL hits using live prices."""
@@ -222,12 +222,16 @@ async def main() -> None:
     # 4. Agent pipeline
     pipeline = build_pipeline(config.llm)
 
-    # 5. ExchangeClient + SentimentFetcher
-    exchange_client = ExchangeClient()
+    # 5. MultiExchangeClient + SentimentFetcher
+    exchange_client = MultiExchangeClient(
+        enabled_exchanges=config.exchanges.enabled,
+        ohlcv_source=config.exchanges.ohlcv_source,
+    )
     sentiment_fetcher: SentimentFetcher | None = None
     if config.news.enabled:
         sentiment_fetcher = SentimentFetcher(
             cryptopanic_token=config.news.cryptopanic_token,
+            lunarcrush_api_key=config.news.lunarcrush_api_key,
             cache_ttl=config.news.cache_ttl_seconds,
         )
         logger.info("News/sentiment fetcher enabled")

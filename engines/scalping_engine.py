@@ -252,16 +252,15 @@ class ScalpingEngine(BaseEngine):
         rsi_extremity = max(0.0, (abs(rsi - 50) - 15) / 35)  # 0→1 as RSI moves from 50 to 35/65
         confidence = 0.55 + (rsi_extremity * 0.2)
 
-        # Fetch futures data
-        funding_rate, oi_data, ls_data = None, None, None
+        # Fetch futures data — one aggregated call across all exchanges
+        futures_data: dict[str, Any] = {}
         try:
-            funding_rate = await self._client.fetch_funding_rate(pair)
-            oi_data = await self._client.fetch_open_interest(pair)
-            ls_data = await self._client.fetch_long_short_ratio(pair)
+            futures_data = await self._client.fetch_aggregated_futures_data(pair)
         except Exception as exc:
-            logger.debug("Failed to fetch futures data for %s: %s", pair, exc)
+            logger.debug("Failed to fetch aggregated futures data for %s: %s", pair, exc)
 
-        # Funding rate filter
+        # Funding rate filter — use average across all exchanges
+        funding_rate = futures_data.get("funding_rate_avg")
         if funding_rate is not None:
             fr = float(funding_rate)
             if direction == "LONG" and fr > 0.0005:
@@ -269,15 +268,16 @@ class ScalpingEngine(BaseEngine):
             elif direction == "SHORT" and fr < -0.0005:
                 confidence -= 0.20
 
-        # Open interest filter
-        if oi_data is not None:
-            oi_change = float(oi_data.get("change_pct", 0))
+        # Open interest filter — use aggregated total OI change
+        oi_change = float(futures_data.get("oi_change_pct", 0))
+        if oi_change != 0:
             if (direction == "LONG" and oi_change > 0) or (direction == "SHORT" and oi_change < 0):
                 confidence += 0.10
 
-        # Long/short ratio filter
-        if ls_data is not None:
-            ls_ratio = float(ls_data.get("long_short_ratio", 1.0))
+        # Long/short ratio filter — use averaged ratio
+        ls_avg = futures_data.get("ls_ratio_avg")
+        if ls_avg is not None:
+            ls_ratio = float(ls_avg)
             if direction == "LONG" and ls_ratio > 2.0:
                 confidence -= 0.15
 
@@ -299,10 +299,6 @@ class ScalpingEngine(BaseEngine):
             "reasoning": f"EMA crossover {ema_crossover}, RSI {rsi:.1f}, vol ratio {indicators.get('volume_ratio', 0):.1f}x",
             "market_data": {
                 **market_data,
-                "futures": {
-                    "funding_rate": funding_rate,
-                    "open_interest": oi_data,
-                    "long_short_ratio": ls_data,
-                },
+                "futures": futures_data,
             },
         }
