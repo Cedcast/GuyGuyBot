@@ -301,3 +301,226 @@ def detect_rsi_divergence(
     except Exception:
         logger.debug("detect_rsi_divergence failed", exc_info=True)
         return "NONE"
+
+
+# ---------------------------------------------------------------------------
+# ADX (Average Directional Index)
+# ---------------------------------------------------------------------------
+
+def calculate_adx(
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    period: int = 14,
+) -> dict[str, float]:
+    """Return ``{adx, plus_di, minus_di}`` for the most recent candle.
+
+    Uses Wilder's smoothing (EMA with ``com=period-1``).
+    Returns all-zero dict when there is insufficient data (need
+    ``period * 2 + 1`` candles minimum) or on any error.
+    """
+    empty: dict[str, float] = {"adx": 0.0, "plus_di": 0.0, "minus_di": 0.0}
+    if len(closes) < period * 2 + 1:
+        return empty
+    try:
+        df = pd.DataFrame({"high": highs, "low": lows, "close": closes}, dtype=float)
+        prev_high = df["high"].shift(1)
+        prev_low = df["low"].shift(1)
+        prev_close = df["close"].shift(1)
+
+        # True Range
+        tr = pd.concat(
+            [
+                df["high"] - df["low"],
+                (df["high"] - prev_close).abs(),
+                (df["low"] - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+
+        # Directional movement
+        up_move = df["high"] - prev_high
+        down_move = prev_low - df["low"]
+        plus_dm = pd.Series(0.0, index=df.index, dtype=float)
+        minus_dm = pd.Series(0.0, index=df.index, dtype=float)
+        plus_dm[up_move > down_move] = up_move[up_move > down_move].clip(lower=0)
+        minus_dm[down_move > up_move] = down_move[down_move > up_move].clip(lower=0)
+
+        # Wilder smoothing
+        smoothed_tr = tr.ewm(com=period - 1, min_periods=period).mean()
+        smoothed_plus_dm = plus_dm.ewm(com=period - 1, min_periods=period).mean()
+        smoothed_minus_dm = minus_dm.ewm(com=period - 1, min_periods=period).mean()
+
+        plus_di = 100 * smoothed_plus_dm / smoothed_tr.replace(0, float("nan"))
+        minus_di = 100 * smoothed_minus_dm / smoothed_tr.replace(0, float("nan"))
+
+        dx_denom = plus_di + minus_di
+        dx = 100 * (plus_di - minus_di).abs() / dx_denom.replace(0, float("nan"))
+        dx = dx.fillna(0)
+
+        adx = dx.ewm(com=period - 1, min_periods=period).mean()
+
+        adx_val = float(adx.iloc[-1])
+        plus_di_val = float(plus_di.iloc[-1])
+        minus_di_val = float(minus_di.iloc[-1])
+
+        return {
+            "adx": adx_val if not pd.isna(adx_val) else 0.0,
+            "plus_di": plus_di_val if not pd.isna(plus_di_val) else 0.0,
+            "minus_di": minus_di_val if not pd.isna(minus_di_val) else 0.0,
+        }
+    except Exception:
+        logger.debug("calculate_adx failed", exc_info=True)
+        return empty
+
+
+# ---------------------------------------------------------------------------
+# Support / Resistance Detection
+# ---------------------------------------------------------------------------
+
+def detect_support_resistance(
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    lookback: int = 50,
+    min_touches: int = 2,
+) -> dict[str, Any]:
+    """Identify the nearest support and resistance levels via swing-point clustering.
+
+    Returns ``{support, resistance, support_touches, resistance_touches}``.
+    Returns zeroed dict on error or when no swing points are found.
+    """
+    empty: dict[str, Any] = {
+        "support": 0.0,
+        "resistance": 0.0,
+        "support_touches": 0,
+        "resistance_touches": 0,
+    }
+    try:
+        n = min(lookback, len(lows))
+        h = highs[-n:]
+        lo = lows[-n:]
+        current_price = closes[-1]
+
+        # Find swing lows (exclude first and last)
+        swing_lows: list[float] = []
+        for i in range(1, n - 1):
+            if lo[i] < lo[i - 1] and lo[i] < lo[i + 1]:
+                swing_lows.append(lo[i])
+
+        # Find swing highs
+        swing_highs: list[float] = []
+        for i in range(1, n - 1):
+            if h[i] > h[i - 1] and h[i] > h[i + 1]:
+                swing_highs.append(h[i])
+
+        def _cluster(levels: list[float], tolerance: float = 0.005) -> list[tuple[float, int]]:
+            """Group nearby levels within *tolerance* fraction of each other.
+
+            Returns a list of ``(representative_level, touch_count)`` tuples.
+            """
+            if not levels:
+                return []
+            sorted_levels = sorted(levels)
+            clusters: list[tuple[float, int]] = []
+            group = [sorted_levels[0]]
+            for lvl in sorted_levels[1:]:
+                ref = group[0]
+                if ref != 0 and abs(lvl - ref) / ref <= tolerance:
+                    group.append(lvl)
+                else:
+                    clusters.append((sum(group) / len(group), len(group)))
+                    group = [lvl]
+            clusters.append((sum(group) / len(group), len(group)))
+            return clusters
+
+        # Cluster swing lows → support candidates
+        support_clusters = _cluster(swing_lows)
+        valid_supports = [(lvl, cnt) for lvl, cnt in support_clusters if cnt >= min_touches]
+
+        if valid_supports:
+            # Nearest support below current price
+            below = [(lvl, cnt) for lvl, cnt in valid_supports if lvl < current_price]
+            if below:
+                support_lvl, support_touches = max(below, key=lambda x: x[0])
+            else:
+                support_lvl, support_touches = max(valid_supports, key=lambda x: x[0])
+        elif swing_lows:
+            support_lvl = min(swing_lows)
+            support_touches = 1
+        else:
+            support_lvl = 0.0
+            support_touches = 0
+
+        # Cluster swing highs → resistance candidates
+        resistance_clusters = _cluster(swing_highs)
+        valid_resistances = [(lvl, cnt) for lvl, cnt in resistance_clusters if cnt >= min_touches]
+
+        if valid_resistances:
+            # Nearest resistance above current price
+            above = [(lvl, cnt) for lvl, cnt in valid_resistances if lvl > current_price]
+            if above:
+                resistance_lvl, resistance_touches = min(above, key=lambda x: x[0])
+            else:
+                resistance_lvl, resistance_touches = min(valid_resistances, key=lambda x: x[0])
+        elif swing_highs:
+            resistance_lvl = max(swing_highs)
+            resistance_touches = 1
+        else:
+            resistance_lvl = 0.0
+            resistance_touches = 0
+
+        return {
+            "support": float(support_lvl),
+            "resistance": float(resistance_lvl),
+            "support_touches": int(support_touches),
+            "resistance_touches": int(resistance_touches),
+        }
+    except Exception:
+        logger.debug("detect_support_resistance failed", exc_info=True)
+        return empty
+
+
+# ---------------------------------------------------------------------------
+# VWAP
+# ---------------------------------------------------------------------------
+
+def calculate_vwap(
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    volumes: list[float],
+) -> float:
+    """Return the Volume-Weighted Average Price for the provided candles.
+
+    Returns ``closes[-1]`` on error or zero total volume.
+    """
+    try:
+        tp = [(h + lo + c) / 3.0 for h, lo, c in zip(highs, lows, closes)]
+        total_vol = sum(volumes)
+        if total_vol == 0:
+            return closes[-1]
+        vwap = sum(t * v for t, v in zip(tp, volumes)) / total_vol
+        return float(vwap)
+    except Exception:
+        logger.debug("calculate_vwap failed", exc_info=True)
+        return closes[-1] if closes else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Market Regime Classification
+# ---------------------------------------------------------------------------
+
+def classify_market_regime(adx: float, plus_di: float, minus_di: float) -> str:
+    """Return a market regime string based on ADX and DI values.
+
+    Returns:
+        ``"STRONG_TREND"`` when ADX >= 25 and ``|+DI - -DI| > 10``
+        ``"WEAK_TREND"``   when ADX >= 20
+        ``"RANGING"``      otherwise
+    """
+    if adx >= 25 and abs(plus_di - minus_di) > 10:
+        return "STRONG_TREND"
+    if adx >= 20:
+        return "WEAK_TREND"
+    return "RANGING"

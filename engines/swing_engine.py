@@ -14,13 +14,22 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+import pandas as pd
+
 from data.indicators import (
+    calculate_adx,
     calculate_atr,
+    calculate_bollinger_bands,
     calculate_ema,
     calculate_macd,
     calculate_rsi,
+    calculate_stochastic,
+    calculate_volume_sma,
+    calculate_vwap,
+    classify_market_regime,
     detect_ema_crossover,
     detect_rsi_divergence,
+    detect_support_resistance,
 )
 from engines.base_engine import BaseEngine
 
@@ -114,7 +123,6 @@ class SwingEngine(BaseEngine):
             atr = calculate_atr(highs, lows, closes)
 
             # RSI series for divergence detection — compute full RSI series once via pandas
-            import pandas as pd
             s = pd.Series(closes, dtype=float)
             delta = s.diff()
             gain = delta.clip(lower=0)
@@ -128,6 +136,19 @@ class SwingEngine(BaseEngine):
             price_window = closes[-lookback:]
             rsi_divergence = detect_rsi_divergence(price_window, rsi_series, lookback=20)
 
+            volumes = [c["volume"] for c in candles]
+            vol_sma = calculate_volume_sma(volumes, 20)
+            current_volume = volumes[-1]
+            volume_ratio = current_volume / vol_sma if vol_sma > 0 else 1.0
+            bb = calculate_bollinger_bands(closes)
+            stoch = calculate_stochastic(highs, lows, closes)
+            adx_data = calculate_adx(highs, lows, closes)
+            sr = detect_support_resistance(highs, lows, closes, lookback=80)
+            vwap = calculate_vwap(highs, lows, closes, volumes)
+            regime = classify_market_regime(
+                adx_data["adx"], adx_data["plus_di"], adx_data["minus_di"]
+            )
+
             return {
                 "pair": pair,
                 "timeframe": timeframe,
@@ -135,7 +156,7 @@ class SwingEngine(BaseEngine):
                 "open": candles[-1]["open"],
                 "high": candles[-1]["high"],
                 "low": candles[-1]["low"],
-                "volume": candles[-1]["volume"],
+                "volume": current_volume,
                 "candles": candles,
                 "closes": closes,
                 "highs": highs,
@@ -152,6 +173,24 @@ class SwingEngine(BaseEngine):
                     },
                     "atr": round(atr, 6),
                     "rsi_divergence": rsi_divergence,
+                    "bb": {
+                        "upper": round(bb["upper"], 6),
+                        "middle": round(bb["middle"], 6),
+                        "lower": round(bb["lower"], 6),
+                        "bandwidth": round(bb["bandwidth"], 4),
+                    },
+                    "stoch": {
+                        "k": round(stoch["k"], 2),
+                        "d": round(stoch["d"], 2),
+                    },
+                    "adx": round(adx_data["adx"], 2),
+                    "plus_di": round(adx_data["plus_di"], 2),
+                    "minus_di": round(adx_data["minus_di"], 2),
+                    "support": round(sr["support"], 6),
+                    "resistance": round(sr["resistance"], 6),
+                    "vwap": round(vwap, 6),
+                    "regime": regime,
+                    "volume_ratio": round(volume_ratio, 2),
                 },
             }
         except Exception as exc:
@@ -166,12 +205,21 @@ class SwingEngine(BaseEngine):
     def _has_setup(market_data: dict[str, Any]) -> bool:
         """Return True if at least 2 of 3 swing setup conditions are met.
 
+        An ADX gate is applied first: ranging markets with ADX < 20 are skipped.
+
         Conditions:
           1. RSI divergence detected (BULLISH_DIV or BEARISH_DIV)
           2. EMA50 vs EMA200 alignment (crossover or clear separation)
           3. MACD histogram turning (positive = bullish, negative = bearish)
         """
         indicators = market_data.get("indicators", {})
+
+        # ADX gate: require at least weak trend for swing trades
+        regime = indicators.get("regime", "RANGING")
+        adx_val = float(indicators.get("adx", 0))
+        if regime == "RANGING" and adx_val < 20:
+            return False
+
         rsi_div = indicators.get("rsi_divergence", "NONE")
         ema_crossover = indicators.get("ema_crossover", "NONE")
         ema50 = float(indicators.get("ema50", 0))
@@ -191,7 +239,7 @@ class SwingEngine(BaseEngine):
     # ------------------------------------------------------------------
 
     async def _build_signal(self, pair: str, market_data: dict[str, Any]) -> dict[str, Any] | None:
-        """Build a signal with real ATR-based SL/TP and futures data filters."""
+        """Build a signal with S/R-aware SL/TP and weighted confidence scoring."""
         assert self._client is not None
         indicators = market_data.get("indicators", {})
         close = float(market_data["close"])
@@ -201,6 +249,15 @@ class SwingEngine(BaseEngine):
         ema200 = float(indicators.get("ema200", 1))
         rsi_div = indicators.get("rsi_divergence", "NONE")
         macd_hist = float(indicators.get("macd", {}).get("histogram", 0))
+        vwap = float(indicators.get("vwap", close))
+        adx = float(indicators.get("adx", 0))
+        plus_di = float(indicators.get("plus_di", 0))
+        minus_di = float(indicators.get("minus_di", 0))
+        support = float(indicators.get("support", 0))
+        resistance = float(indicators.get("resistance", 0))
+        volume_ratio = float(indicators.get("volume_ratio", 1.0))
+        stoch = indicators.get("stoch", {})
+        regime = indicators.get("regime", "RANGING")
 
         # Determine direction
         if ema_crossover == "BULLISH" or (ema50 > ema200 and rsi_div == "BULLISH_DIV") or (ema50 > ema200 and macd_hist > 0):
@@ -210,8 +267,16 @@ class SwingEngine(BaseEngine):
         else:
             return None  # No clear direction
 
-        # SL = 2.5x ATR; TP = 2x SL (minimum 2:1 RR)
-        sl_distance = atr * 2.5
+        # S/R-aware SL: place behind nearest S/R level; fall back to 2.5x ATR
+        sl_distance = atr * 2.5  # default
+        if direction == "LONG" and support > 0 and support < close:
+            sr_distance = close - support
+            if atr * 0.5 < sr_distance < atr * 5:
+                sl_distance = sr_distance + atr * 0.3
+        elif direction == "SHORT" and resistance > 0 and resistance > close:
+            sr_distance = resistance - close
+            if atr * 0.5 < sr_distance < atr * 5:
+                sl_distance = sr_distance + atr * 0.3
         tp_distance = sl_distance * 2.0
 
         if sl_distance <= 0:
@@ -230,12 +295,44 @@ class SwingEngine(BaseEngine):
         if risk <= 0 or (reward / risk) < 2.0:
             return None
 
-        # Base confidence from EMA alignment and divergence signals
-        confidence = 0.58
+        # Weighted confidence scoring
+        confidence = 0.50
+
+        # ADX contribution (max +0.18)
+        adx_score = min(1.0, max(0.0, (adx - 15) / 35))
+        confidence += adx_score * 0.18
+
+        # EMA crossover bonus
         if ema_crossover != "NONE":
-            confidence += 0.10
-        if rsi_div in ("BULLISH_DIV", "BEARISH_DIV"):
             confidence += 0.08
+
+        # RSI divergence bonus
+        if rsi_div in ("BULLISH_DIV", "BEARISH_DIV"):
+            confidence += 0.07
+
+        # S/R proximity (max +0.12)
+        if direction == "LONG" and support > 0 and close > 0:
+            proximity = 1.0 - min(1.0, (close - support) / (close * 0.03))
+            confidence += proximity * 0.12
+        elif direction == "SHORT" and resistance > 0 and close > 0:
+            proximity = 1.0 - min(1.0, (resistance - close) / (close * 0.03))
+            confidence += proximity * 0.12
+
+        # Volume contribution (max +0.08)
+        vol_score = min(1.0, max(0.0, (volume_ratio - 1.0) / 2.0))
+        confidence += vol_score * 0.08
+
+        # DI alignment bonus
+        if direction == "LONG" and plus_di > minus_di:
+            confidence += 0.05
+        elif direction == "SHORT" and minus_di > plus_di:
+            confidence += 0.05
+
+        # VWAP alignment bonus
+        if direction == "LONG" and close > vwap:
+            confidence += 0.04
+        elif direction == "SHORT" and close < vwap:
+            confidence += 0.04
 
         # Fetch futures data — one aggregated call across all exchanges
         futures_data: dict[str, Any] = {}
@@ -281,9 +378,16 @@ class SwingEngine(BaseEngine):
             "stop_loss": stop_loss,
             "take_profit": take_profit,
             "confidence": confidence,
+            "adx": round(adx, 2),
+            "regime": regime,
+            "support": round(support, 6),
+            "resistance": round(resistance, 6),
+            "vwap": round(vwap, 6),
             "reasoning": (
-                f"EMA50/200 {'bullish' if ema50 > ema200 else 'bearish'} "
-                f"({ema_crossover}), RSI div: {rsi_div}, MACD hist: {macd_hist:.4f}"
+                f"Regime: {regime}, ADX: {adx:.1f}, "
+                f"EMA50/200 {'bullish' if ema50 > ema200 else 'bearish'} ({ema_crossover}), "
+                f"RSI div: {rsi_div}, MACD hist: {macd_hist:.4f}, "
+                f"VWAP: {'above' if close > vwap else 'below'}"
             ),
             "market_data": {
                 **market_data,

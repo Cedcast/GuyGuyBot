@@ -15,11 +15,17 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from data.indicators import (
+    calculate_adx,
     calculate_atr,
+    calculate_bollinger_bands,
     calculate_ema,
     calculate_rsi,
+    calculate_stochastic,
     calculate_volume_sma,
+    calculate_vwap,
+    classify_market_regime,
     detect_ema_crossover,
+    detect_support_resistance,
 )
 from engines.base_engine import BaseEngine
 
@@ -120,6 +126,14 @@ class ScalpingEngine(BaseEngine):
             vol_sma = calculate_volume_sma(volumes, 20)
             current_volume = volumes[-1]
             volume_ratio = current_volume / vol_sma if vol_sma > 0 else 1.0
+            bb = calculate_bollinger_bands(closes)
+            stoch = calculate_stochastic(highs, lows, closes)
+            adx_data = calculate_adx(highs, lows, closes)
+            sr = detect_support_resistance(highs, lows, closes)
+            vwap = calculate_vwap(highs, lows, closes, volumes)
+            regime = classify_market_regime(
+                adx_data["adx"], adx_data["plus_di"], adx_data["minus_di"]
+            )
 
             return {
                 "pair": pair,
@@ -141,6 +155,23 @@ class ScalpingEngine(BaseEngine):
                     "ema_crossover": ema_crossover,
                     "atr": round(atr, 6),
                     "volume_ratio": round(volume_ratio, 2),
+                    "bb": {
+                        "upper": round(bb["upper"], 6),
+                        "middle": round(bb["middle"], 6),
+                        "lower": round(bb["lower"], 6),
+                        "bandwidth": round(bb["bandwidth"], 4),
+                    },
+                    "stoch": {
+                        "k": round(stoch["k"], 2),
+                        "d": round(stoch["d"], 2),
+                    },
+                    "adx": round(adx_data["adx"], 2),
+                    "plus_di": round(adx_data["plus_di"], 2),
+                    "minus_di": round(adx_data["minus_di"], 2),
+                    "support": round(sr["support"], 6),
+                    "resistance": round(sr["resistance"], 6),
+                    "vwap": round(vwap, 6),
+                    "regime": regime,
                 },
             }
         except Exception as exc:
@@ -153,24 +184,70 @@ class ScalpingEngine(BaseEngine):
 
     @staticmethod
     def _has_setup(market_data: dict[str, Any]) -> bool:
-        """Return True if at least 2 of 3 scalping conditions are met.
+        """Return True when at least 3 of 5 directional signals agree.
 
-        Conditions:
-          1. RSI < 35 (oversold) or RSI > 65 (overbought)
-          2. EMA9 vs EMA21 crossover detected
-          3. Current volume > 1.5x 20-period average
+        Signals:
+          1. Price vs VWAP
+          2. RSI extreme (< 40 bullish, > 60 bearish)
+          3. Bollinger Band touch
+          4. EMA9/21 crossover
+          5. Stochastic K extreme (< 25 bullish, > 75 bearish)
+
+        An ADX gate is applied first: ranging markets are skipped entirely.
         """
         indicators = market_data.get("indicators", {})
         rsi = float(indicators.get("rsi", 50))
         ema_crossover = indicators.get("ema_crossover", "NONE")
         volume_ratio = float(indicators.get("volume_ratio", 1.0))
+        bb = indicators.get("bb", {})
+        close = float(market_data.get("close", 0))
+        vwap = float(indicators.get("vwap", close))
+        regime = indicators.get("regime", "RANGING")
+        stoch = indicators.get("stoch", {})
 
-        condition_1 = rsi < 35 or rsi > 65
-        condition_2 = ema_crossover in ("BULLISH", "BEARISH")
-        condition_3 = volume_ratio > 1.5
+        # ADX gate: skip ranging markets entirely
+        if regime == "RANGING":
+            return False
 
-        met = sum([condition_1, condition_2, condition_3])
-        return met >= 2
+        # Build 5-signal vote
+        bullish_votes = 0
+        bearish_votes = 0
+
+        # Signal 1: VWAP
+        if close > vwap:
+            bullish_votes += 1
+        elif close < vwap:
+            bearish_votes += 1
+
+        # Signal 2: RSI
+        if rsi < 40:
+            bullish_votes += 1
+        elif rsi > 60:
+            bearish_votes += 1
+
+        # Signal 3: Bollinger Bands
+        bb_lower = float(bb.get("lower", 0))
+        bb_upper = float(bb.get("upper", float("inf")))
+        if bb_lower > 0 and close <= bb_lower * 1.005:
+            bullish_votes += 1
+        elif bb_upper > 0 and close >= bb_upper * 0.995:
+            bearish_votes += 1
+
+        # Signal 4: EMA crossover
+        if ema_crossover == "BULLISH":
+            bullish_votes += 1
+        elif ema_crossover == "BEARISH":
+            bearish_votes += 1
+
+        # Signal 5: Stochastic
+        stoch_k = float(stoch.get("k", 50))
+        if stoch_k < 25:
+            bullish_votes += 1
+        elif stoch_k > 75:
+            bearish_votes += 1
+
+        dominant = max(bullish_votes, bearish_votes)
+        return dominant >= 3
 
     # ------------------------------------------------------------------
     # Multi-timeframe confluence
@@ -208,28 +285,69 @@ class ScalpingEngine(BaseEngine):
     # ------------------------------------------------------------------
 
     async def _build_signal(self, pair: str, market_data: dict[str, Any]) -> dict[str, Any] | None:
-        """Build a signal with real ATR-based SL/TP and futures data filters."""
+        """Build a signal with S/R-aware SL/TP and weighted confidence scoring."""
         assert self._client is not None
         indicators = market_data.get("indicators", {})
         close = float(market_data["close"])
         atr = float(indicators.get("atr", close * 0.005))
         ema_crossover = indicators.get("ema_crossover", "NONE")
         rsi = float(indicators.get("rsi", 50))
+        vwap = float(indicators.get("vwap", close))
+        bb = indicators.get("bb", {})
+        stoch = indicators.get("stoch", {})
+        adx = float(indicators.get("adx", 0))
+        plus_di = float(indicators.get("plus_di", 0))
+        minus_di = float(indicators.get("minus_di", 0))
+        support = float(indicators.get("support", 0))
+        resistance = float(indicators.get("resistance", 0))
+        volume_ratio = float(indicators.get("volume_ratio", 1.0))
+        regime = indicators.get("regime", "RANGING")
 
-        # Determine direction from EMA crossover; fall back to RSI extremes
+        # Recompute direction vote (mirrors _has_setup)
+        bullish_votes = 0
+        bearish_votes = 0
+        if close > vwap:
+            bullish_votes += 1
+        elif close < vwap:
+            bearish_votes += 1
+        if rsi < 40:
+            bullish_votes += 1
+        elif rsi > 60:
+            bearish_votes += 1
+        bb_lower = float(bb.get("lower", 0))
+        bb_upper = float(bb.get("upper", float("inf")))
+        if bb_lower > 0 and close <= bb_lower * 1.005:
+            bullish_votes += 1
+        elif bb_upper > 0 and close >= bb_upper * 0.995:
+            bearish_votes += 1
         if ema_crossover == "BULLISH":
-            direction = "LONG"
+            bullish_votes += 1
         elif ema_crossover == "BEARISH":
-            direction = "SHORT"
-        elif rsi < 35:
+            bearish_votes += 1
+        stoch_k = float(stoch.get("k", 50))
+        if stoch_k < 25:
+            bullish_votes += 1
+        elif stoch_k > 75:
+            bearish_votes += 1
+
+        if bullish_votes > bearish_votes and bullish_votes >= 3:
             direction = "LONG"
-        elif rsi > 65:
+        elif bearish_votes > bullish_votes and bearish_votes >= 3:
             direction = "SHORT"
         else:
-            return None  # No clear direction
+            return None
 
-        # SL = 1.5x ATR; TP = 2x SL (minimum 2:1 RR)
-        sl_distance = atr * 1.5
+        # S/R-aware SL: place behind nearest S/R level; fall back to 1.5x ATR
+        sl_distance = atr * 1.5  # default
+        if direction == "LONG" and support > 0 and support < close:
+            sr_distance = close - support
+            if atr * 0.5 < sr_distance < atr * 3:
+                sl_distance = sr_distance + atr * 0.2  # small buffer beyond S/R
+        elif direction == "SHORT" and resistance > 0 and resistance > close:
+            sr_distance = resistance - close
+            if atr * 0.5 < sr_distance < atr * 3:
+                sl_distance = sr_distance + atr * 0.2
+
         tp_distance = sl_distance * 2.0
 
         if sl_distance <= 0:
@@ -248,9 +366,34 @@ class ScalpingEngine(BaseEngine):
         if risk <= 0 or (reward / risk) < 2.0:
             return None
 
-        # Base confidence from RSI extremity and crossover
-        rsi_extremity = max(0.0, (abs(rsi - 50) - 15) / 35)  # 0→1 as RSI moves from 50 to 35/65
-        confidence = 0.55 + (rsi_extremity * 0.2)
+        # Weighted confidence scoring
+        confidence = 0.50
+
+        # ADX contribution (25% weight, max +0.20)
+        adx_score = min(1.0, max(0.0, (adx - 20) / 30))
+        confidence += adx_score * 0.20
+
+        # S/R proximity contribution (20% weight, max +0.15)
+        if direction == "LONG" and support > 0 and close > 0:
+            proximity = 1.0 - min(1.0, (close - support) / (close * 0.02))
+            confidence += proximity * 0.15
+        elif direction == "SHORT" and resistance > 0 and close > 0:
+            proximity = 1.0 - min(1.0, (resistance - close) / (close * 0.02))
+            confidence += proximity * 0.15
+
+        # Volume contribution (15% weight, max +0.10)
+        vol_score = min(1.0, max(0.0, (volume_ratio - 1.0) / 2.0))
+        confidence += vol_score * 0.10
+
+        # Vote strength contribution (max +0.10)
+        vote_strength = max(bullish_votes, bearish_votes) / 5.0
+        confidence += vote_strength * 0.10
+
+        # DI alignment bonus (+0.05 if DI agrees with direction)
+        if direction == "LONG" and plus_di > minus_di:
+            confidence += 0.05
+        elif direction == "SHORT" and minus_di > plus_di:
+            confidence += 0.05
 
         # Fetch futures data — one aggregated call across all exchanges
         futures_data: dict[str, Any] = {}
@@ -296,7 +439,16 @@ class ScalpingEngine(BaseEngine):
             "stop_loss": stop_loss,
             "take_profit": take_profit,
             "confidence": confidence,
-            "reasoning": f"EMA crossover {ema_crossover}, RSI {rsi:.1f}, vol ratio {indicators.get('volume_ratio', 0):.1f}x",
+            "adx": round(adx, 2),
+            "regime": regime,
+            "support": round(support, 6),
+            "resistance": round(resistance, 6),
+            "vwap": round(vwap, 6),
+            "reasoning": (
+                f"Regime: {regime}, ADX: {adx:.1f}, "
+                f"votes: {max(bullish_votes, bearish_votes)}/5, "
+                f"RSI: {rsi:.1f}, VWAP: {'above' if close > vwap else 'below'}"
+            ),
             "market_data": {
                 **market_data,
                 "futures": futures_data,
