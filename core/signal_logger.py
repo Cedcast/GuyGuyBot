@@ -196,6 +196,36 @@ class SignalLogger:
         row = self._db.execute_one("SELECT * FROM trades WHERE id = ?", (trade_id,))
         return dict(row) if row else None
 
+    def update_trade_fields(self, trade_id: int, fields: dict) -> None:
+        """Update arbitrary fields on a trade record by id.
+
+        Parameters
+        ----------
+        trade_id:
+            The id of the trade row to update.
+        fields:
+            Mapping of column names to new values.  Only columns that exist
+            in the ``trades`` table are accepted; unknown keys are silently
+            dropped to prevent SQL injection via column names.
+        """
+        if not fields:
+            return
+        _ALLOWED_COLUMNS = frozenset({
+            "stop_loss", "take_profit", "outcome", "close_time", "close_price",
+            "pnl", "r_multiple", "tp1_hit",
+        })
+        safe_fields = {k: v for k, v in fields.items() if k in _ALLOWED_COLUMNS}
+        if not safe_fields:
+            logger.warning("update_trade_fields: no valid columns in %s", list(fields.keys()))
+            return
+        set_clause = ", ".join(f"{k} = ?" for k in safe_fields)
+        values = list(safe_fields.values()) + [trade_id]
+        self._db.execute_write(
+            f"UPDATE trades SET {set_clause} WHERE id = ?",
+            tuple(values),
+        )
+        logger.debug("Updated trade #%d fields: %s", trade_id, list(safe_fields.keys()))
+
     # ------------------------------------------------------------------
     # Stats
     # ------------------------------------------------------------------

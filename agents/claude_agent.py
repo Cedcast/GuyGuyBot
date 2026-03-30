@@ -55,7 +55,7 @@ You MUST respond with ONLY a valid JSON object:
   "risk_notes": "<any risk warnings, max 100 chars>"
 }
 
-Only emit LONG or SHORT if confidence >= 0.65.
+Only emit LONG or SHORT if confidence >= 0.70.
 You have the final veto — if anything feels wrong, return NEUTRAL.
 Maintain minimum 2:1 R:R on all trades."""
 
@@ -81,6 +81,10 @@ def _build_prompt(market_data: dict[str, Any], context: dict[str, Any]) -> str:
     entry = market_data.get("entry", market_data.get("close", 0))
     stop_loss = market_data.get("stop_loss", 0)
     take_profit = market_data.get("take_profit", 0)
+    tp1 = market_data.get("take_profit_1", "N/A")
+    tp2 = market_data.get("take_profit_2", "N/A")
+    candle_pct = market_data.get("candle_completion_pct")
+    candle_pct_str = f"{candle_pct:.0f}%" if candle_pct is not None else "N/A"
     confidence = float(market_data.get("confidence", 0.0))
     reasoning = market_data.get("reasoning", "N/A")
     close = float(market_data.get("close", entry or 0))
@@ -149,6 +153,8 @@ def _build_prompt(market_data: dict[str, Any], context: dict[str, Any]) -> str:
         "=== SIGNAL BRIEF ===",
         f"Pair: {pair}  |  Timeframe: {timeframe}  |  Engine: {engine}",
         f"Direction: {direction}  |  Entry: {entry}  |  SL: {stop_loss}  |  TP: {take_profit}",
+        f"TP1 (50% at 1:1 RR): {tp1}  |  TP2 (50% at 3:1 RR): {tp2}",
+        f"Candle completion: {candle_pct_str}",
         f"Engine Confidence: {confidence:.2f}  |  Reasoning: {reasoning}",
         "",
         "=== MARKET REGIME ===",

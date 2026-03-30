@@ -11,6 +11,7 @@ ratio filter, RSI divergence, MACD trend, and minimum confidence gate.
 
 from __future__ import annotations
 
+import datetime
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -41,7 +42,13 @@ logger = logging.getLogger(__name__)
 _MIN_CANDLES = 100
 
 # Minimum confidence (after all adjustments) to pass signal to pipeline
-_MIN_CONFIDENCE = 0.68
+_MIN_CONFIDENCE = 0.73
+
+# Seconds per timeframe — used for candle-age and completion calculations
+_TF_SECONDS: dict[str, int] = {
+    "1m": 60, "5m": 300, "15m": 900, "30m": 1800,
+    "1h": 3600, "4h": 14400, "1d": 86400,
+}
 
 
 class SwingEngine(BaseEngine):
@@ -87,6 +94,11 @@ class SwingEngine(BaseEngine):
                     continue
 
                 if not self._has_setup(market_data):
+                    continue
+
+                # HTF confluence: for 4h signals, require 1d EMA50/200 to agree
+                if not await self._check_htf_confluence(pair, market_data):
+                    logger.debug("SwingEngine: HTF confluence failed for %s/%s", pair, timeframe)
                     continue
 
                 signal = await self._build_signal(pair, market_data)
@@ -235,12 +247,55 @@ class SwingEngine(BaseEngine):
         return met >= 2
 
     # ------------------------------------------------------------------
+    # HTF confluence
+    # ------------------------------------------------------------------
+
+    async def _check_htf_confluence(self, pair: str, market_data: dict[str, Any]) -> bool:
+        """For 4h signals, check 1d EMA50/200 direction agrees. 1d signals always pass."""
+        assert self._client is not None
+        timeframe = market_data.get("timeframe", "")
+        if timeframe != "4h":
+            return True  # 1d is already the highest TF we use
+
+        indicators = market_data.get("indicators", {})
+        ema50 = float(indicators.get("ema50", 0))
+        ema200 = float(indicators.get("ema200", 1))
+        signal_bullish = ema50 > ema200
+
+        try:
+            htf_candles = await self._client.fetch_ohlcv(pair, "1d", limit=210)
+            if len(htf_candles) < 200:
+                return True  # not enough data — don't block
+            htf_closes = [float(c["close"]) for c in htf_candles]
+            htf_ema50 = calculate_ema(htf_closes, 50)
+            htf_ema200 = calculate_ema(htf_closes, 200)
+            htf_bullish = htf_ema50 > htf_ema200
+            return signal_bullish == htf_bullish
+        except Exception:
+            return True  # fail open
+
+    # ------------------------------------------------------------------
     # Signal building with futures filters
     # ------------------------------------------------------------------
 
     async def _build_signal(self, pair: str, market_data: dict[str, Any]) -> dict[str, Any] | None:
         """Build a signal with S/R-aware SL/TP and weighted confidence scoring."""
         assert self._client is not None
+
+        # Candle-age gate: only enter in the last 20% of a candle's lifespan
+        tf = market_data.get("timeframe", "")
+        tf_secs = _TF_SECONDS.get(tf, 0)
+        if tf_secs > 0:
+            now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
+            candle_position = now_ts % tf_secs
+            candle_completion = candle_position / tf_secs
+            if candle_completion < 0.80:
+                logger.debug(
+                    "SwingEngine: candle only %.0f%% complete for %s/%s — skipping mid-candle entry",
+                    candle_completion * 100, pair, tf,
+                )
+                return None
+
         indicators = market_data.get("indicators", {})
         close = float(market_data["close"])
         atr = float(indicators.get("atr", close * 0.02))
@@ -267,8 +322,13 @@ class SwingEngine(BaseEngine):
         else:
             return None  # No clear direction
 
-        # S/R-aware SL: place behind nearest S/R level; fall back to 2.5x ATR
-        sl_distance = atr * 2.5  # default
+        # Volume gate: require ≥1.2× average volume to confirm directional move
+        if volume_ratio < 1.2:
+            logger.debug("SwingEngine: insufficient volume (%.2fx) for %s — skipped", volume_ratio, pair)
+            return None
+
+        # S/R-aware SL: place behind nearest S/R level; fall back to 3.0× ATR
+        sl_distance = atr * 3.0  # was 2.5
         if direction == "LONG" and support > 0 and support < close:
             sr_distance = close - support
             if atr * 0.5 < sr_distance < atr * 5:
@@ -341,6 +401,24 @@ class SwingEngine(BaseEngine):
         except Exception as exc:
             logger.debug("Failed to fetch aggregated futures data for %s: %s", pair, exc)
 
+        # Multi-exchange consensus gate: require funding sign to agree across ≥2 exchanges
+        exchanges_futures = futures_data.get("by_exchange", {})
+        if exchanges_futures:
+            funding_signs = [
+                1 if float(v.get("funding_rate", 0)) > 0 else (-1 if float(v.get("funding_rate", 0)) < 0 else 0)
+                for v in exchanges_futures.values()
+                if v.get("funding_rate") is not None
+            ]
+            if len(funding_signs) >= 2:
+                positive_count = funding_signs.count(1)
+                negative_count = funding_signs.count(-1)
+                if direction == "LONG" and positive_count > negative_count:
+                    logger.debug("SwingEngine: cross-exchange funding consensus against LONG for %s — skipped", pair)
+                    return None
+                if direction == "SHORT" and negative_count > positive_count:
+                    logger.debug("SwingEngine: cross-exchange funding consensus against SHORT for %s — skipped", pair)
+                    return None
+
         # Funding rate filter — use average across all exchanges
         funding_rate = futures_data.get("funding_rate_avg")
         if funding_rate is not None:
@@ -369,6 +447,12 @@ class SwingEngine(BaseEngine):
             logger.debug("SwingEngine: confidence %.2f below gate for %s — skipped", confidence, pair)
             return None
 
+        # Candle completion percentage (for Claude context)
+        candle_completion_pct: float | None = None
+        if tf_secs > 0:
+            completion_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
+            candle_completion_pct = round(((completion_ts % tf_secs) / tf_secs) * 100, 1)
+
         return {
             "pair": pair,
             "engine": "swing",
@@ -377,6 +461,9 @@ class SwingEngine(BaseEngine):
             "entry": round(close, 6),
             "stop_loss": stop_loss,
             "take_profit": take_profit,
+            "take_profit_1": round(close + sl_distance * 1.0, 6) if direction == "LONG" else round(close - sl_distance * 1.0, 6),
+            "take_profit_2": round(close + sl_distance * 3.0, 6) if direction == "LONG" else round(close - sl_distance * 3.0, 6),
+            "candle_completion_pct": candle_completion_pct,
             "confidence": confidence,
             "adx": round(adx, 2),
             "regime": regime,

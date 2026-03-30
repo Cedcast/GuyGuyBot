@@ -11,6 +11,7 @@ confluence, long/short ratio filter, and minimum confidence gate.
 
 from __future__ import annotations
 
+import datetime
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -38,7 +39,13 @@ logger = logging.getLogger(__name__)
 _MIN_CANDLES = 50
 
 # Minimum confidence (after all adjustments) to pass signal to pipeline
-_MIN_CONFIDENCE = 0.68
+_MIN_CONFIDENCE = 0.73
+
+# Seconds per timeframe — used for candle-age and completion calculations
+_TF_SECONDS: dict[str, int] = {
+    "1m": 60, "5m": 300, "15m": 900, "30m": 1800,
+    "1h": 3600, "4h": 14400, "1d": 86400,
+}
 
 
 class ScalpingEngine(BaseEngine):
@@ -246,8 +253,11 @@ class ScalpingEngine(BaseEngine):
         elif stoch_k > 75:
             bearish_votes += 1
 
-        dominant = max(bullish_votes, bearish_votes)
-        return dominant >= 3
+        if bullish_votes > bearish_votes and bullish_votes >= 4:
+            return True
+        if bearish_votes > bullish_votes and bearish_votes >= 4:
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Multi-timeframe confluence
@@ -287,6 +297,27 @@ class ScalpingEngine(BaseEngine):
     async def _build_signal(self, pair: str, market_data: dict[str, Any]) -> dict[str, Any] | None:
         """Build a signal with S/R-aware SL/TP and weighted confidence scoring."""
         assert self._client is not None
+
+        # Time-of-day blackout: UTC 00:00–04:00 (low-liquidity, fakeout-prone)
+        _now_utc_hour = datetime.datetime.now(datetime.timezone.utc).hour
+        if 0 <= _now_utc_hour < 4:
+            logger.debug("ScalpingEngine: low-liquidity window (UTC %02d:xx) — skipping %s", _now_utc_hour, pair)
+            return None
+
+        # Candle-age gate: only enter in the last 20% of a candle's lifespan
+        tf = market_data.get("timeframe", "")
+        tf_secs = _TF_SECONDS.get(tf, 0)
+        if tf_secs > 0:
+            now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
+            candle_position = now_ts % tf_secs
+            candle_completion = candle_position / tf_secs
+            if candle_completion < 0.80:
+                logger.debug(
+                    "ScalpingEngine: candle only %.0f%% complete for %s/%s — skipping mid-candle entry",
+                    candle_completion * 100, pair, tf,
+                )
+                return None
+
         indicators = market_data.get("indicators", {})
         close = float(market_data["close"])
         atr = float(indicators.get("atr", close * 0.005))
@@ -302,6 +333,12 @@ class ScalpingEngine(BaseEngine):
         resistance = float(indicators.get("resistance", 0))
         volume_ratio = float(indicators.get("volume_ratio", 1.0))
         regime = indicators.get("regime", "RANGING")
+
+        # BB bandwidth volatility gate: skip already-broken squeezes
+        bb_bw = float(bb.get("bandwidth", 0))
+        if bb_bw > 0.08:
+            logger.debug("ScalpingEngine: BB bandwidth %.4f too wide for %s — skipped", bb_bw, pair)
+            return None
 
         # Recompute direction vote (mirrors _has_setup)
         bullish_votes = 0
@@ -330,15 +367,20 @@ class ScalpingEngine(BaseEngine):
         elif stoch_k > 75:
             bearish_votes += 1
 
-        if bullish_votes > bearish_votes and bullish_votes >= 3:
+        if bullish_votes > bearish_votes and bullish_votes >= 4:
             direction = "LONG"
-        elif bearish_votes > bullish_votes and bearish_votes >= 3:
+        elif bearish_votes > bullish_votes and bearish_votes >= 4:
             direction = "SHORT"
         else:
             return None
 
-        # S/R-aware SL: place behind nearest S/R level; fall back to 1.5x ATR
-        sl_distance = atr * 1.5  # default
+        # Volume gate: require ≥1.2× average volume to confirm directional move
+        if volume_ratio < 1.2:
+            logger.debug("ScalpingEngine: insufficient volume (%.2fx) for %s — skipped", volume_ratio, pair)
+            return None
+
+        # S/R-aware SL: place behind nearest S/R level; fall back to 2.0× ATR
+        sl_distance = atr * 2.0  # was 1.5 — wider fallback keeps SL outside noise
         if direction == "LONG" and support > 0 and support < close:
             sr_distance = close - support
             if atr * 0.5 < sr_distance < atr * 3:
@@ -347,6 +389,16 @@ class ScalpingEngine(BaseEngine):
             sr_distance = resistance - close
             if atr * 0.5 < sr_distance < atr * 3:
                 sl_distance = sr_distance + atr * 0.2
+
+        # BB SL check: skip if SL would land inside the Bollinger Band
+        bb_lower_val = float(bb.get("lower", 0))
+        bb_upper_val = float(bb.get("upper", float("inf")))
+        if direction == "LONG" and bb_lower_val > 0 and (close - sl_distance) > bb_lower_val:
+            logger.debug("ScalpingEngine: SL inside BB lower for %s — skipped", pair)
+            return None
+        if direction == "SHORT" and bb_upper_val < float("inf") and (close + sl_distance) < bb_upper_val:
+            logger.debug("ScalpingEngine: SL inside BB upper for %s — skipped", pair)
+            return None
 
         tp_distance = sl_distance * 2.0
 
@@ -402,6 +454,24 @@ class ScalpingEngine(BaseEngine):
         except Exception as exc:
             logger.debug("Failed to fetch aggregated futures data for %s: %s", pair, exc)
 
+        # Multi-exchange consensus gate: require funding sign to agree across ≥2 exchanges
+        exchanges_futures = futures_data.get("by_exchange", {})
+        if exchanges_futures:
+            funding_signs = [
+                1 if float(v.get("funding_rate", 0)) > 0 else (-1 if float(v.get("funding_rate", 0)) < 0 else 0)
+                for v in exchanges_futures.values()
+                if v.get("funding_rate") is not None
+            ]
+            if len(funding_signs) >= 2:
+                positive_count = funding_signs.count(1)
+                negative_count = funding_signs.count(-1)
+                if direction == "LONG" and positive_count > negative_count:
+                    logger.debug("ScalpingEngine: cross-exchange funding consensus against LONG for %s — skipped", pair)
+                    return None
+                if direction == "SHORT" and negative_count > positive_count:
+                    logger.debug("ScalpingEngine: cross-exchange funding consensus against SHORT for %s — skipped", pair)
+                    return None
+
         # Funding rate filter — use average across all exchanges
         funding_rate = futures_data.get("funding_rate_avg")
         if funding_rate is not None:
@@ -430,6 +500,12 @@ class ScalpingEngine(BaseEngine):
             logger.debug("ScalpingEngine: confidence %.2f below gate for %s — skipped", confidence, pair)
             return None
 
+        # Candle completion percentage (for Claude context)
+        candle_completion_pct: float | None = None
+        if tf_secs > 0:
+            completion_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
+            candle_completion_pct = round(((completion_ts % tf_secs) / tf_secs) * 100, 1)
+
         return {
             "pair": pair,
             "engine": "scalping",
@@ -438,6 +514,9 @@ class ScalpingEngine(BaseEngine):
             "entry": round(close, 6),
             "stop_loss": stop_loss,
             "take_profit": take_profit,
+            "take_profit_1": round(close + (sl_distance * 1.0), 6) if direction == "LONG" else round(close - (sl_distance * 1.0), 6),
+            "take_profit_2": round(close + (sl_distance * 3.0), 6) if direction == "LONG" else round(close - (sl_distance * 3.0), 6),
+            "candle_completion_pct": candle_completion_pct,
             "confidence": confidence,
             "adx": round(adx, 2),
             "regime": regime,
