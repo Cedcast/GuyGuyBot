@@ -6,8 +6,10 @@ All network/exchange calls are replaced with mocks.
 """
 from __future__ import annotations
 
+import datetime
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
-from unittest.mock import AsyncMock, MagicMock
 
 from engines.swing_engine import SwingEngine
 
@@ -39,6 +41,20 @@ def _make_candles(n: int, price: float = 100.0, trend: float = 0.0) -> list[dict
             {"open": p - 0.1, "high": p + 0.5, "low": p - 0.5, "close": p, "volume": 1000.0}
         )
     return candles
+
+
+# Fixed datetime that satisfies the candle-age gate for 4h candles:
+#   UTC hour = 11 (not in any blackout)
+#   timestamp % 14400 = 12240 → completion = 85 % (≥ 80 %)
+_MOCK_DT_4H = datetime.datetime(2024, 1, 15, 11, 24, 0, tzinfo=datetime.timezone.utc)
+
+
+def _make_dt_patch(fixed_dt: datetime.datetime):
+    """Return a context manager that patches datetime in swing_engine."""
+    mock_module = MagicMock()
+    mock_module.datetime.now.return_value = fixed_dt
+    mock_module.timezone.utc = datetime.timezone.utc
+    return patch("engines.swing_engine.datetime", mock_module)
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +230,8 @@ async def test_build_signal_long_direction():
     client = make_mock_client([])
     engine = SwingEngine(pairs=["BTCUSDT"], timeframes=["4h"], exchange_client=client)
 
-    signal = await engine._build_signal("BTCUSDT", market_data)
+    with _make_dt_patch(_MOCK_DT_4H):
+        signal = await engine._build_signal("BTCUSDT", market_data)
 
     assert signal is not None, "Expected a LONG signal but got None"
     assert signal["direction"] == "LONG"
@@ -234,7 +251,8 @@ async def test_build_signal_short_direction():
     )
     engine = SwingEngine(pairs=["BTCUSDT"], timeframes=["4h"], exchange_client=client)
 
-    signal = await engine._build_signal("BTCUSDT", market_data)
+    with _make_dt_patch(_MOCK_DT_4H):
+        signal = await engine._build_signal("BTCUSDT", market_data)
 
     assert signal is not None, "Expected a SHORT signal but got None"
     assert signal["direction"] == "SHORT"

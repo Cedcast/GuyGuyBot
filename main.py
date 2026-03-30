@@ -156,7 +156,17 @@ async def _trade_monitor_loop(
                     continue
 
                 outcome = _check_trade_outcome(trade, close_price)
-                if outcome:
+                if outcome == "TP1":
+                    # Partial TP: mark tp1_hit, move SL to break-even, notify
+                    entry_price = float(trade["entry"])
+                    signal_logger.update_trade_fields(
+                        trade["id"],
+                        {"tp1_hit": 1, "stop_loss": entry_price},
+                    )
+                    # Build a synthetic trade dict for the notification
+                    tp1_trade = {**trade, "outcome": "TP1", "close_price": close_price}
+                    await bot.send_trade_outcome(tp1_trade)
+                elif outcome:
                     closed = signal_logger.close_trade(trade["id"], close_price, outcome)
                     risk_gate.close_position(trade["pair"], trade["engine"])
                     await bot.send_trade_outcome(closed)
@@ -171,22 +181,29 @@ async def _trade_monitor_loop(
 
 
 def _check_trade_outcome(trade: dict[str, Any], current_price: float) -> str | None:
-    """Return ``'TP'``, ``'SL'``, or ``None`` based on *current_price*."""
-    entry = float(trade["entry"])
-    stop_loss = float(trade["stop_loss"])
-    take_profit = float(trade["take_profit"])
-    direction = trade["direction"]
+    """Return ``'TP'``, ``'TP1'``, ``'SL'``, or ``None`` based on *current_price*."""
+    direction = trade.get("direction", "LONG")
+    entry = float(trade.get("entry", 0))
+    stop_loss = float(trade.get("stop_loss", 0))
+    take_profit = float(trade.get("take_profit", 0))
+    take_profit_1 = trade.get("take_profit_1")  # partial TP — 50% at 1:1 RR
+    tp1_hit = bool(trade.get("tp1_hit", False))  # avoid double-triggering
 
     if direction == "LONG":
+        if stop_loss > 0 and current_price <= stop_loss:
+            return "SL"
+        # Check TP1 first if not already hit
+        if not tp1_hit and take_profit_1 is not None and current_price >= float(take_profit_1):
+            return "TP1"
         if current_price >= take_profit:
             return "TP"
-        if current_price <= stop_loss:
-            return "SL"
     else:  # SHORT
+        if stop_loss > 0 and current_price >= stop_loss:
+            return "SL"
+        if not tp1_hit and take_profit_1 is not None and current_price <= float(take_profit_1):
+            return "TP1"
         if current_price <= take_profit:
             return "TP"
-        if current_price >= stop_loss:
-            return "SL"
     return None
 
 

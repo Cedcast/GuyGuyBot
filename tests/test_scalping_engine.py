@@ -6,8 +6,10 @@ All network/exchange calls are replaced with mocks.
 """
 from __future__ import annotations
 
+import datetime
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
-from unittest.mock import AsyncMock, MagicMock
 
 from engines.scalping_engine import ScalpingEngine
 
@@ -35,6 +37,20 @@ def _make_candles(n: int, price: float = 100.0) -> list[dict]:
         {"open": price - 0.1, "high": price + 0.5, "low": price - 0.5, "close": price, "volume": 1000.0}
         for _ in range(n)
     ]
+
+
+# Fixed datetime that satisfies both gates for 30m candles:
+#   UTC hour = 10 (not in blackout 00-04)
+#   timestamp % 1800 = 1530 → completion = 85 % (≥ 80 %)
+_MOCK_DT_30M = datetime.datetime(2024, 1, 15, 10, 25, 30, tzinfo=datetime.timezone.utc)
+
+
+def _make_dt_patch(fixed_dt: datetime.datetime):
+    """Return a context manager that patches datetime in scalping_engine."""
+    mock_module = MagicMock()
+    mock_module.datetime.now.return_value = fixed_dt
+    mock_module.timezone.utc = datetime.timezone.utc
+    return patch("engines.scalping_engine.datetime", mock_module)
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +121,12 @@ def _make_bullish_market_data(
     volume_ratio: float = 2.0,
     support: float = 99.0,
 ) -> tuple[dict, MagicMock]:
-    """Return (market_data, mock_client) configured for a LONG signal."""
+    """Return (market_data, mock_client) configured for a LONG signal.
+
+    Produces 4 bullish votes (VWAP, RSI, EMA crossover, Stochastic) so the
+    4/5 threshold introduced by the 1i optimisation is satisfied.
+    BB bandwidth is set to 0.04 (below the 0.08 gate).
+    """
     market_data = {
         "pair": "BTCUSDT",
         "timeframe": "30m",
@@ -130,15 +151,15 @@ def _make_bullish_market_data(
                 "upper": 110.0,
                 "middle": 100.0,
                 "lower": 90.0,
-                "bandwidth": 0.20,
+                "bandwidth": 0.04,   # below the 0.08 bandwidth gate
             },
-            "stoch": {"k": 30.0, "d": 35.0},
+            "stoch": {"k": 20.0, "d": 25.0},  # vote 4: bullish (k < 25)
             "adx": adx,
             "plus_di": plus_di,
             "minus_di": minus_di,
             "support": support,
             "resistance": 110.0,
-            "vwap": 99.0,            # vote 3: bullish (close > vwap)
+            "vwap": 99.0,            # vote 1: bullish (close > vwap)
             "regime": "WEAK_TREND",
         },
     }
@@ -160,7 +181,8 @@ async def test_build_signal_returns_valid_rr():
         pairs=["BTCUSDT"], timeframes=["30m"], exchange_client=client
     )
 
-    signal = await engine._build_signal("BTCUSDT", market_data)
+    with _make_dt_patch(_MOCK_DT_30M):
+        signal = await engine._build_signal("BTCUSDT", market_data)
 
     # Signal may be None if confidence gate not met, but with our crafted data it should pass
     if signal is not None:
@@ -182,13 +204,15 @@ async def test_build_signal_returns_none_below_confidence_gate():
         adx=21.0,             # very low ADX → minimal contribution
         plus_di=11.0,
         minus_di=10.0,
-        volume_ratio=1.0,     # no volume boost
+        volume_ratio=1.0,     # below 1.2 volume gate → will be caught early
         support=0.0,          # no S/R proximity boost
     )
     engine = ScalpingEngine(
         pairs=["BTCUSDT"], timeframes=["30m"], exchange_client=client
     )
-    signal = await engine._build_signal("BTCUSDT", market_data)
+
+    with _make_dt_patch(_MOCK_DT_30M):
+        signal = await engine._build_signal("BTCUSDT", market_data)
     assert signal is None
 
 

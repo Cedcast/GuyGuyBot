@@ -223,7 +223,24 @@ class GuyGuyBot:
             logger.error("Failed to send signal message: %s", exc)
 
     async def send_trade_outcome(self, trade: dict[str, Any]) -> None:
-        """Send a TP or SL notification message."""
+        """Send a TP, TP1, or SL notification message."""
+        outcome = trade.get("outcome", "")
+        if outcome == "TP1":
+            msg = (
+                f"✅ <b>TP1 Hit</b> — {trade.get('pair')} {trade.get('direction')}\n"
+                f"50% position closed at 1:1 RR. Stop-loss moved to break-even.\n"
+                f"Riding remaining 50% to TP2: <code>{trade.get('take_profit_2', 'N/A')}</code>"
+            )
+            try:
+                await self._app.bot.send_message(
+                    chat_id=self._chat_id,
+                    text=msg,
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as exc:
+                logger.error("Failed to send TP1 outcome message: %s", exc)
+            return
+
         text = format_trade_outcome_message(trade)
         try:
             await self._app.bot.send_message(
