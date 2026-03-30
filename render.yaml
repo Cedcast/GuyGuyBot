@@ -18,7 +18,7 @@ services:
       - key: GROK_API_KEY
         sync: false
       - key: CRYPTOPANIC_TOKEN
-        value: Pub
+        sync: false
       - key: LUNARCRUSH_API_KEY
         sync: false
       - key: DATABASE_PATH
