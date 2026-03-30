@@ -1,7 +1,7 @@
 """
 agents/claude_agent.py
 ----------------------
-Claude (Anthropic) LLM agent — real Anthropic API implementation.
+Claude Opus (Anthropic) LLM agent — final decision validator (Stage 2).
 """
 
 from __future__ import annotations
@@ -18,32 +18,42 @@ from agents.base_agent import BaseAgent
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = """You are an expert crypto derivatives trader specialising in perpetual futures.
-You have deep knowledge of technical analysis, funding rates, open interest, and market microstructure.
+_DEFAULT_MODEL = "claude-opus-4-5"
 
-When analysing market data, you MUST consider:
-1. Price action and trend direction
-2. RSI, EMA crossovers, MACD for momentum
-3. Funding rate direction (positive = longs paying = potential short squeeze risk)
-4. Open interest trend (rising OI confirms trend, falling OI = weakening)
-5. Fear & Greed Index (extreme greed > 80 = caution on longs, extreme fear < 20 = caution on shorts)
-6. News sentiment (negative news = avoid longs, positive news = confirms bullish bias)
-7. Volume confirmation (high volume breakouts are more reliable)
+_SYSTEM_PROMPT = """You are the final decision authority for a crypto futures trading bot.
+Two specialist screeners have already pre-filtered this signal:
+- A technical analysis screener
+- A sentiment and futures data screener
 
-You MUST respond with ONLY a valid JSON object, no markdown, no explanation outside the JSON:
+Both screeners agreed on a direction with sufficient confidence.
+Your job is to make the FINAL go/no-go decision with full context.
+
+Consider EVERYTHING:
+1. Technical setup quality (price action, indicators, trend strength)
+2. Futures market structure (funding rate, open interest, long/short ratio)
+3. Sentiment context (fear/greed, news headlines, market mood)
+4. Risk assessment (is the reward worth the risk right now?)
+5. Macro context (are there red flags the screeners may have missed?)
+6. Leverage recommendation (conservative 3-10x based on conviction)
+
+The screener pre-analysis will be provided in the context.
+
+You MUST respond with ONLY a valid JSON object:
 {
   "direction": "LONG" | "SHORT" | "NEUTRAL",
   "confidence": 0.0-1.0,
   "entry": <float>,
   "stop_loss": <float>,
   "take_profit": <float>,
-  "leverage": <int between 3 and 20>,
+  "leverage": <int between 3 and 15>,
   "reasoning": "<concise explanation max 200 chars>",
-  "key_factors": ["factor1", "factor2", "factor3"]
+  "key_factors": ["factor1", "factor2", "factor3"],
+  "risk_notes": "<any risk warnings, max 100 chars>"
 }
 
-Only emit LONG or SHORT if confidence >= 0.60. Otherwise emit NEUTRAL.
-For futures, always calculate TP/SL based on ATR if provided, maintaining minimum 2:1 R:R."""
+Only emit LONG or SHORT if confidence >= 0.65.
+You have the final veto — if anything feels wrong, return NEUTRAL.
+Maintain minimum 2:1 R:R on all trades."""
 
 _RETRY_ATTEMPTS = 2
 _RETRY_DELAY = 1.0
@@ -59,7 +69,7 @@ def _parse_llm_json(text: str) -> dict[str, Any]:
 
 
 def _build_prompt(market_data: dict[str, Any], context: dict[str, Any]) -> str:
-    """Build a structured prompt from market data and context."""
+    """Build a full-context prompt including screener consensus when available."""
     parts = [f"Pair: {market_data.get('pair', '?')}"]
     parts.append(f"Timeframe: {market_data.get('timeframe', '?')}")
     parts.append(f"Current Price: {market_data.get('close', 0)}")
@@ -94,18 +104,40 @@ def _build_prompt(market_data: dict[str, Any], context: dict[str, Any]) -> str:
         if headlines:
             parts.append(f"Recent Headlines: {'; '.join(headlines[:3])}")
 
+    # Include screener pre-analysis when available (tiered pipeline context)
+    screener_consensus = context.get("screener_consensus")
+    if screener_consensus:
+        parts.append("")
+        parts.append("Screener Pre-Analysis:")
+        gpt_screen = screener_consensus.get("gpt4o", {})
+        grok_screen = screener_consensus.get("grok", {})
+        if gpt_screen:
+            parts.append(
+                f"- TA Screener (GPT): {gpt_screen.get('direction')} "
+                f"@ {gpt_screen.get('confidence', 0):.2f} — {gpt_screen.get('reasoning', '')}"
+            )
+        if grok_screen:
+            parts.append(
+                f"- Sentiment Screener (Grok): {grok_screen.get('direction')} "
+                f"@ {grok_screen.get('confidence', 0):.2f} — {grok_screen.get('reasoning', '')}"
+            )
+
     return "\n".join(parts)
 
 
 class ClaudeAgent(BaseAgent):
-    """LLM agent backed by Anthropic's Claude API."""
+    """LLM agent backed by Anthropic's Claude API (final decision validator)."""
+
+    def __init__(self, api_key: str, model: str = _DEFAULT_MODEL) -> None:
+        super().__init__(api_key)
+        self.model = model
 
     @property
     def name(self) -> str:
         return "claude"
 
     async def analyze(self, market_data: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
-        """Call Claude to analyse *market_data* and return a structured signal."""
+        """Call Claude to make the final go/no-go decision on *market_data*."""
         prompt = _build_prompt(market_data, context)
         pair = market_data.get("pair", "?")
         close = float(market_data.get("close", 0.0))
@@ -129,8 +161,8 @@ class ClaudeAgent(BaseAgent):
         for attempt in range(_RETRY_ATTEMPTS + 1):
             try:
                 message = await client.messages.create(
-                    model="claude-opus-4-5",
-                    max_tokens=1024,
+                    model=self.model,
+                    max_tokens=512,
                     system=_SYSTEM_PROMPT,
                     messages=[{"role": "user", "content": prompt}],
                 )
@@ -146,6 +178,7 @@ class ClaudeAgent(BaseAgent):
                     "leverage": int(parsed.get("leverage", 10)),
                     "reasoning": str(parsed.get("reasoning", ""))[:200],
                     "key_factors": parsed.get("key_factors", []),
+                    "risk_notes": str(parsed.get("risk_notes", ""))[:100],
                 }
             except (json.JSONDecodeError, KeyError, ValueError) as exc:
                 logger.warning("[ClaudeAgent] JSON parse error for %s (attempt %d): %s", pair, attempt, exc)
@@ -172,7 +205,7 @@ class ClaudeAgent(BaseAgent):
         try:
             client = anthropic.AsyncAnthropic(api_key=self.api_key)
             message = await client.messages.create(
-                model="claude-opus-4-5",
+                model=self.model,
                 max_tokens=256,
                 system="You are a concise crypto trading analyst.",
                 messages=[{"role": "user", "content": prompt}],

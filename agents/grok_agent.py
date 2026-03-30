@@ -1,7 +1,7 @@
 """
 agents/grok_agent.py
 --------------------
-Grok (xAI) LLM agent — real xAI API implementation.
+Grok-3-mini (xAI) LLM agent — sentiment & futures data screener (Stage 1).
 
 Grok is compatible with the OpenAI API format — the client is pointed
 at xAI's endpoint via ``base_url``.
@@ -22,33 +22,28 @@ from agents.base_agent import BaseAgent
 logger = logging.getLogger(__name__)
 
 _XAI_BASE_URL = "https://api.x.ai/v1"
+_DEFAULT_MODEL = "grok-3-mini"
 
-_SYSTEM_PROMPT = """You are an expert crypto derivatives trader specialising in perpetual futures.
-You have deep knowledge of technical analysis, funding rates, open interest, and market microstructure.
+_SYSTEM_PROMPT = """You are a crypto futures sentiment and market structure screener.
+Your ONLY job is to analyse the futures market data and sentiment signals.
 
-When analysing market data, you MUST consider:
-1. Price action and trend direction
-2. RSI, EMA crossovers, MACD for momentum
-3. Funding rate direction (positive = longs paying = potential short squeeze risk)
-4. Open interest trend (rising OI confirms trend, falling OI = weakening)
-5. Fear & Greed Index (extreme greed > 80 = caution on longs, extreme fear < 20 = caution on shorts)
-6. News sentiment (negative news = avoid longs, positive news = confirms bullish bias)
-7. Volume confirmation (high volume breakouts are more reliable)
+Focus EXCLUSIVELY on:
+- Funding rate direction and magnitude (positive = longs paying = squeeze risk)
+- Open interest change percentage (rising OI confirms trend)
+- Long/short ratio (extreme ratios = crowded trade risk)
+- Fear & Greed Index (>80 extreme greed = caution longs, <20 extreme fear = caution shorts)
+- News sentiment score and recent headlines
 
-You MUST respond with ONLY a valid JSON object, no markdown, no explanation outside the JSON:
+You MUST respond with ONLY a valid JSON object:
 {
   "direction": "LONG" | "SHORT" | "NEUTRAL",
   "confidence": 0.0-1.0,
-  "entry": <float>,
-  "stop_loss": <float>,
-  "take_profit": <float>,
-  "leverage": <int between 3 and 20>,
-  "reasoning": "<concise explanation max 200 chars>",
-  "key_factors": ["factor1", "factor2", "factor3"]
+  "reasoning": "<max 100 chars, sentiment/futures factors only>"
 }
 
-Only emit LONG or SHORT if confidence >= 0.60. Otherwise emit NEUTRAL.
-For futures, always calculate TP/SL based on ATR if provided, maintaining minimum 2:1 R:R."""
+Be strict: only emit LONG or SHORT if confidence >= 0.65 based on sentiment/futures data alone.
+Do NOT consider price action or technical indicators — that is handled separately.
+This is a pre-filter. When in doubt, return NEUTRAL."""
 
 _RETRY_ATTEMPTS = 2
 _RETRY_DELAY = 1.0
@@ -63,22 +58,10 @@ def _parse_llm_json(text: str) -> dict[str, Any]:
 
 
 def _build_prompt(market_data: dict[str, Any], context: dict[str, Any]) -> str:
-    """Build a structured prompt from market data and context."""
+    """Build a sentiment/futures-only prompt (excludes TA indicators)."""
     parts = [f"Pair: {market_data.get('pair', '?')}"]
     parts.append(f"Timeframe: {market_data.get('timeframe', '?')}")
     parts.append(f"Current Price: {market_data.get('close', 0)}")
-
-    indicators = market_data.get("indicators", {})
-    if indicators:
-        parts.append(f"RSI: {indicators.get('rsi', 'N/A')}")
-        parts.append(f"EMA Fast: {indicators.get('ema_fast', 'N/A')}")
-        parts.append(f"EMA Slow: {indicators.get('ema_slow', 'N/A')}")
-        parts.append(f"EMA Crossover: {indicators.get('ema_crossover', 'N/A')}")
-        macd = indicators.get("macd", {})
-        if macd:
-            parts.append(f"MACD Histogram: {macd.get('histogram', 'N/A')}")
-        parts.append(f"ATR: {indicators.get('atr', 'N/A')}")
-        parts.append(f"Volume vs Avg: {indicators.get('volume_ratio', 'N/A')}")
 
     futures = market_data.get("futures", {})
     if futures:
@@ -102,14 +85,18 @@ def _build_prompt(market_data: dict[str, Any], context: dict[str, Any]) -> str:
 
 
 class GrokAgent(BaseAgent):
-    """LLM agent backed by xAI's Grok API (OpenAI-compatible)."""
+    """LLM agent backed by xAI's Grok API (sentiment & futures screener)."""
+
+    def __init__(self, api_key: str, model: str = _DEFAULT_MODEL) -> None:
+        super().__init__(api_key)
+        self.model = model
 
     @property
     def name(self) -> str:
         return "grok"
 
     async def analyze(self, market_data: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
-        """Call Grok to analyse *market_data* and return a structured signal."""
+        """Call Grok to screen *market_data* for sentiment/futures setups."""
         prompt = _build_prompt(market_data, context)
         pair = market_data.get("pair", "?")
         close = float(market_data.get("close", 0.0))
@@ -121,7 +108,7 @@ class GrokAgent(BaseAgent):
             "entry": close,
             "stop_loss": 0.0,
             "take_profit": 0.0,
-            "reasoning": "Grok: no actionable signal.",
+            "reasoning": "Grok: no actionable sentiment signal.",
         }
 
         if not self.api_key:
@@ -133,12 +120,12 @@ class GrokAgent(BaseAgent):
         for attempt in range(_RETRY_ATTEMPTS + 1):
             try:
                 response = await client.chat.completions.create(
-                    model="grok-3",
+                    model=self.model,
                     messages=[
                         {"role": "system", "content": _SYSTEM_PROMPT},
                         {"role": "user", "content": prompt},
                     ],
-                    max_tokens=512,
+                    max_tokens=256,
                 )
                 raw_text = response.choices[0].message.content or ""
                 parsed = _parse_llm_json(raw_text)
@@ -146,12 +133,10 @@ class GrokAgent(BaseAgent):
                     "agent": self.name,
                     "direction": parsed.get("direction", "NEUTRAL"),
                     "confidence": float(parsed.get("confidence", 0.0)),
-                    "entry": float(parsed.get("entry", close)),
-                    "stop_loss": float(parsed.get("stop_loss", 0.0)),
-                    "take_profit": float(parsed.get("take_profit", 0.0)),
-                    "leverage": int(parsed.get("leverage", 10)),
-                    "reasoning": str(parsed.get("reasoning", ""))[:200],
-                    "key_factors": parsed.get("key_factors", []),
+                    "entry": close,
+                    "stop_loss": 0.0,
+                    "take_profit": 0.0,
+                    "reasoning": str(parsed.get("reasoning", ""))[:100],
                 }
             except (json.JSONDecodeError, KeyError, ValueError) as exc:
                 logger.warning("[GrokAgent] JSON parse error for %s (attempt %d): %s", pair, attempt, exc)
@@ -178,7 +163,7 @@ class GrokAgent(BaseAgent):
         try:
             client = AsyncOpenAI(api_key=self.api_key, base_url=_XAI_BASE_URL)
             response = await client.chat.completions.create(
-                model="grok-3",
+                model=self.model,
                 messages=[
                     {"role": "system", "content": "You are a concise crypto trading analyst."},
                     {"role": "user", "content": prompt},

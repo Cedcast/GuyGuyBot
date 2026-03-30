@@ -76,8 +76,14 @@ class EnginesConfig:
 
 @dataclass
 class LLMConfig:
-    primary_agents: list[str] = field(default_factory=lambda: ["claude", "gpt4o"])
-    arbitration_agent: str = "grok"
+    screener_agents: list[str] = field(default_factory=lambda: ["gpt4o", "grok"])
+    decision_agent: str = "claude"
+    screener_confidence_gate: float = 0.65
+    # Model name overrides
+    gpt4o_model: str = "gpt-4o-mini"
+    grok_model: str = "grok-3-mini"
+    claude_model: str = "claude-opus-4-5"
+    # API keys
     claude_api_key: str = ""
     gpt4o_api_key: str = ""
     grok_api_key: str = ""
@@ -142,7 +148,7 @@ def _parse_engines(raw: dict[str, Any]) -> EnginesConfig:
         )
 
     return EnginesConfig(
-        scalping=_es(raw.get("scalping", {}), ["1m", "5m", "15m", "30m"], 60),
+        scalping=_es(raw.get("scalping", {}), ["30m", "1h"], 900),
         swing=_es(raw.get("swing", {}), ["4h", "1d"], 3600),
     )
 
@@ -208,8 +214,12 @@ def load_config(path: Path | str = CONFIG_PATH) -> Config:
         ),
         engines=_parse_engines(raw.get("engines", {})),
         llm=LLMConfig(
-            primary_agents=llm_raw.get("primary_agents", ["claude", "gpt4o"]),
-            arbitration_agent=llm_raw.get("arbitration_agent", "grok"),
+            screener_agents=llm_raw.get("screener_agents", ["gpt4o", "grok"]),
+            decision_agent=llm_raw.get("decision_agent", "claude"),
+            screener_confidence_gate=float(llm_raw.get("screener_confidence_gate", 0.65)),
+            gpt4o_model=llm_raw.get("gpt4o_model", "gpt-4o-mini"),
+            grok_model=llm_raw.get("grok_model", "grok-3-mini"),
+            claude_model=llm_raw.get("claude_model", "claude-opus-4-5"),
             claude_api_key=claude_key,
             gpt4o_api_key=gpt4o_key,
             grok_api_key=grok_key,

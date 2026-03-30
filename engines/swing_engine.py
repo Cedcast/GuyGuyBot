@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 _MIN_CANDLES = 100
 
 # Minimum confidence (after all adjustments) to pass signal to pipeline
-_MIN_CONFIDENCE = 0.55
+_MIN_CONFIDENCE = 0.68
 
 
 class SwingEngine(BaseEngine):
