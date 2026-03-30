@@ -11,7 +11,7 @@ telegram:
     quarterly: true
 
 database:
-  path: "data/guybot.db"
+  path: "data/guybot.db"   # override with DATABASE_PATH env var (e.g. /data/guybot.db on Render)
 
 trading:
   pairs:
@@ -35,6 +35,11 @@ engines:
     timeframes: ["4h", "1d"]
     scan_interval: 3600   # seconds between scans
 
+exchanges:
+  enabled: ["binance", "bybit", "okx", "kraken"]
+  ohlcv_source: "binance"
+  price_aggregation: "average"
+
 llm:
   # Tier 1 — fast screeners (always called on every candidate)
   screener_agents: ["gpt4o", "grok"]
@@ -57,6 +62,7 @@ news:
   enabled: true
   cache_ttl_seconds: 300
   cryptopanic_token: "Pub"   # Public token, no key needed
+  lunarcrush_api_key: ""     # get free key at lunarcrush.com (optional)
   sentiment_warning_threshold: -0.5
   fear_greed_warning_threshold: 20
 
