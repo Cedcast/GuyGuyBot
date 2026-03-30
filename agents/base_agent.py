@@ -23,10 +23,15 @@ class BaseAgent(ABC):
     ----------
     api_key:
         Authentication key for the LLM provider.
+    model:
+        Optional model name override.  When not provided each subclass
+        falls back to its own default.
     """
 
-    def __init__(self, api_key: str) -> None:
+    def __init__(self, api_key: str, model: str | None = None) -> None:
         self.api_key = api_key
+        if model is not None:
+            self.model = model
 
     @property
     @abstractmethod

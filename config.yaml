@@ -28,17 +28,26 @@ trading:
 engines:
   scalping:
     enabled: true
-    timeframes: ["1m", "5m", "15m", "30m"]
-    scan_interval: 60     # seconds between scans
+    timeframes: ["30m", "1h"]
+    scan_interval: 900    # seconds between scans (quarter of the shortest candle)
   swing:
     enabled: true
     timeframes: ["4h", "1d"]
     scan_interval: 3600   # seconds between scans
 
 llm:
-  # Available models: claude, gpt4o, grok
-  primary_agents: ["claude", "gpt4o"]   # Two agents run per signal
-  arbitration_agent: "grok"              # Third agent for arbitration/summaries
+  # Tier 1 — fast screeners (always called on every candidate)
+  screener_agents: ["gpt4o", "grok"]
+  screener_confidence_gate: 0.65   # Both screeners must hit this to invoke Claude
+
+  # Tier 2 — final decision maker (only called when both screeners agree)
+  decision_agent: "claude"
+
+  # Model names (swap claude_model to claude-sonnet-4-5 to save more cost)
+  gpt4o_model: "gpt-4o-mini"
+  grok_model: "grok-3-mini"
+  claude_model: "claude-opus-4-5"
+
   # API keys - replace with your actual keys or set via environment variables
   claude_api_key: "YOUR_CLAUDE_API_KEY"
   gpt4o_api_key: "YOUR_GPT4O_API_KEY"

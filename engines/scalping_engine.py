@@ -1,7 +1,7 @@
 """
 engines/scalping_engine.py
 --------------------------
-Scalping engine — monitors 1m, 5m, 15m and 30m timeframes.
+Scalping engine — monitors 30m and 1h timeframes.
 
 Uses real OHLCV data from Binance Futures via ExchangeClient and
 calculates real technical indicators via the indicators module.
@@ -32,18 +32,18 @@ logger = logging.getLogger(__name__)
 _MIN_CANDLES = 50
 
 # Minimum confidence (after all adjustments) to pass signal to pipeline
-_MIN_CONFIDENCE = 0.55
+_MIN_CONFIDENCE = 0.68
 
 
 class ScalpingEngine(BaseEngine):
-    """Short-term trade engine scanning 1m – 30m timeframes.
+    """Short-term trade engine scanning 30m and 1h timeframes.
 
     Parameters
     ----------
     pairs:
         Symbols to scan.
     timeframes:
-        Timeframes to iterate (default: ``["1m", "5m", "15m", "30m"]``).
+        Timeframes to iterate (default: ``["30m", "1h"]``).
     exchange_client:
         Optional :class:`~data.exchange_client.ExchangeClient` instance for
         real Binance Futures data.  When not provided the engine returns no
